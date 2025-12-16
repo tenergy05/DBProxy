@@ -3,18 +3,18 @@ package com.poc.pamport.dbproxy.core.audit;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
- * LoggingAuditRecorder serializes audit events as JSON-like maps to JUL.
+ * LoggingAuditRecorder serializes audit events as JSON-like maps to SLF4J.
  * This mirrors Teleport's audit surface but uses a simple logger sink here.
  */
 public final class LoggingAuditRecorder implements AuditRecorder {
     private final Logger log;
 
     public LoggingAuditRecorder() {
-        this(Logger.getLogger(LoggingAuditRecorder.class.getName()));
+        this(LoggerFactory.getLogger(LoggingAuditRecorder.class));
     }
 
     public LoggingAuditRecorder(Logger log) {
@@ -28,14 +28,14 @@ public final class LoggingAuditRecorder implements AuditRecorder {
         if (error != null) {
             payload.put("error", error.getMessage());
         }
-        log.log(Level.INFO, payload.toString());
+        log.info(payload.toString());
     }
 
     @Override
     public void onSessionEnd(DbSession session) {
         Map<String, Object> payload = base(session);
         payload.put("event", "db.session.end");
-        log.log(Level.INFO, payload.toString());
+        log.info(payload.toString());
     }
 
     @Override
@@ -52,7 +52,7 @@ public final class LoggingAuditRecorder implements AuditRecorder {
         if (query.error != null) {
             payload.put("error", query.error.getMessage());
         }
-        log.log(Level.INFO, payload.toString());
+        log.info(payload.toString());
     }
 
     @Override
@@ -66,7 +66,7 @@ public final class LoggingAuditRecorder implements AuditRecorder {
         if (result.error != null) {
             payload.put("error", result.error.getMessage());
         }
-        log.log(Level.INFO, payload.toString());
+        log.info(payload.toString());
     }
 
     private Map<String, Object> base(DbSession session) {

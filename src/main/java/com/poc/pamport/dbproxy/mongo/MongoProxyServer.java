@@ -13,15 +13,15 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import java.util.Objects;
 import java.util.function.Function;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * MongoProxyServer is a placeholder proxy for MongoDB wire protocol.
  * It frames messages using the length field and forwards bytes to the backend.
  */
 public final class MongoProxyServer implements AutoCloseable {
-    private static final Logger log = Logger.getLogger(MongoProxyServer.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(MongoProxyServer.class);
 
     private final Config config;
     private EventLoopGroup bossGroup;
@@ -63,8 +63,7 @@ public final class MongoProxyServer implements AutoCloseable {
 
         ChannelFuture bindFuture = bootstrap.bind(config.listenHost, config.listenPort).sync();
         serverChannel = bindFuture.channel();
-        log.info(() -> "Mongo proxy listening on " + config.listenHost + ":" + config.listenPort
-            + " -> " + connector);
+        log.info("Mongo proxy listening on {}:{} -> {}", config.listenHost, config.listenPort, connector);
     }
 
     public void blockUntilShutdown() throws InterruptedException {
@@ -126,7 +125,7 @@ public final class MongoProxyServer implements AutoCloseable {
             server.start();
             server.blockUntilShutdown();
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Mongo proxy stopped with error", e);
+            log.error("Mongo proxy stopped with error", e);
         }
     }
 }

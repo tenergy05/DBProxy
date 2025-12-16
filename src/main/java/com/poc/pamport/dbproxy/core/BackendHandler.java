@@ -4,12 +4,12 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public final class BackendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
-    private static final Logger log = Logger.getLogger(BackendHandler.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(BackendHandler.class);
 
     private final Channel frontend;
 
@@ -29,7 +29,7 @@ public final class BackendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.log(Level.WARNING, "Backend connection failed", cause);
+        log.warn("Backend connection failed", cause);
         MessagePump.closeOnFlush(frontend);
     }
 }

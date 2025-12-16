@@ -1,20 +1,20 @@
 package com.poc.pamport.dbproxy.postgres;
 
 import com.poc.pamport.dbproxy.core.BackendHandler;
+import com.poc.pamport.dbproxy.core.BackendConnector;
+import com.poc.pamport.dbproxy.core.MessagePump;
+import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
+import com.poc.pamport.dbproxy.core.audit.DbSession;
+import com.poc.pamport.dbproxy.core.audit.Query;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.util.ReferenceCountUtil;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import com.poc.pamport.dbproxy.core.BackendConnector;
-import com.poc.pamport.dbproxy.core.MessagePump;
-import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
-import com.poc.pamport.dbproxy.core.audit.DbSession;
-import com.poc.pamport.dbproxy.core.audit.Query;
 import java.util.function.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * FrontendHandler consumes messages from Postgres clients, parses them for
@@ -22,7 +22,7 @@ import java.util.function.Predicate;
  */
 final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
-    private static final Logger log = Logger.getLogger(FrontendHandler.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(FrontendHandler.class);
 
     private final QueryLogger queryLogger;
     private final AuditRecorder auditRecorder;
@@ -98,7 +98,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.log(Level.WARNING, "Frontend connection failed", cause);
+        log.warn("Frontend connection failed", cause);
         releasePending();
         MessagePump.closeOnFlush(backend);
         ctx.close();
@@ -126,7 +126,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         connector.connect(ctx.channel())
             .addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    log.log(Level.WARNING, "Failed to connect to backend", future.cause());
+                    log.warn("Failed to connect to backend", future.cause());
                     auditRecorder.onSessionStart(session, future.cause());
                     ctx.close();
                     return;

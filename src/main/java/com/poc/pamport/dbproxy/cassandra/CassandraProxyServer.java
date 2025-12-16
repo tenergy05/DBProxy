@@ -13,14 +13,14 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import java.util.Objects;
 import java.util.function.Function;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * CassandraProxyServer is a placeholder proxy for Cassandra native protocol.
  */
 public final class CassandraProxyServer implements AutoCloseable {
-    private static final Logger log = Logger.getLogger(CassandraProxyServer.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(CassandraProxyServer.class);
 
     private final Config config;
     private EventLoopGroup bossGroup;
@@ -62,8 +62,7 @@ public final class CassandraProxyServer implements AutoCloseable {
 
         ChannelFuture bindFuture = bootstrap.bind(config.listenHost, config.listenPort).sync();
         serverChannel = bindFuture.channel();
-        log.info(() -> "Cassandra proxy listening on " + config.listenHost + ":" + config.listenPort
-            + " -> " + connector);
+        log.info("Cassandra proxy listening on {}:{} -> {}", config.listenHost, config.listenPort, connector);
     }
 
     public void blockUntilShutdown() throws InterruptedException {
@@ -125,7 +124,7 @@ public final class CassandraProxyServer implements AutoCloseable {
             server.start();
             server.blockUntilShutdown();
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Cassandra proxy stopped with error", e);
+            log.error("Cassandra proxy stopped with error", e);
         }
     }
 }

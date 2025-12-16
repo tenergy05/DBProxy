@@ -6,8 +6,8 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import java.util.Objects;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
 import com.poc.pamport.dbproxy.core.audit.DbSession;
 import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
@@ -22,7 +22,7 @@ import java.util.HashMap;
  */
 public final class PostgresProxyServer implements AutoCloseable {
 
-    private static final Logger log = Logger.getLogger(PostgresProxyServer.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(PostgresProxyServer.class);
 
     private final Config config;
     private EventLoopGroup bossGroup;
@@ -56,7 +56,7 @@ public final class PostgresProxyServer implements AutoCloseable {
 
         ChannelFuture bindFuture = bootstrap.bind(config.listenHost, config.listenPort).sync();
         serverChannel = bindFuture.channel();
-        log.info(() -> "Postgres proxy listening on " + config.listenHost + ":" + config.listenPort);
+        log.info("Postgres proxy listening on {}:{}", config.listenHost, config.listenPort);
     }
 
     public void blockUntilShutdown() throws InterruptedException {
@@ -158,7 +158,7 @@ public final class PostgresProxyServer implements AutoCloseable {
             server.start();
             server.blockUntilShutdown();
         } catch (Exception e) {
-            log.log(Level.SEVERE, "Proxy stopped with error", e);
+            log.error("Proxy stopped with error", e);
         }
     }
 }

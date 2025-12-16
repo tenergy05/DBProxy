@@ -8,14 +8,14 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.ReferenceCountUtil;
 import java.nio.charset.StandardCharsets;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * PostgresBackendAuditHandler inspects backend responses to emit OnResult audit events.
  */
 final class PostgresBackendAuditHandler extends SimpleChannelInboundHandler<ByteBuf> {
-    private static final Logger log = Logger.getLogger(PostgresBackendAuditHandler.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(PostgresBackendAuditHandler.class);
 
     private final AuditRecorder audit;
     private final DbSession session;
@@ -47,7 +47,7 @@ final class PostgresBackendAuditHandler extends SimpleChannelInboundHandler<Byte
                 }
             }
         } catch (Exception e) {
-            log.log(Level.FINE, "Failed to parse backend message for audit", e);
+            log.debug("Failed to parse backend message for audit", e);
         } finally {
             ReferenceCountUtil.safeRelease(copy);
             ctx.fireChannelRead(msg.retain());

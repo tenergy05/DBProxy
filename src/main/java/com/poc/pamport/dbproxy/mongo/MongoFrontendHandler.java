@@ -10,15 +10,15 @@ import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.ReferenceCountUtil;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * MongoFrontendHandler forwards MongoDB client messages to the backend and invokes optional logging hook.
  */
 final class MongoFrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
-    private static final Logger log = Logger.getLogger(MongoFrontendHandler.class.getName());
+    private static final Logger log = LoggerFactory.getLogger(MongoFrontendHandler.class);
 
     private final BackendConnector connector;
     private final MongoRequestLogger requestLogger;
@@ -35,7 +35,7 @@ final class MongoFrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         connector.connect(ctx.channel())
             .addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
-                    log.log(Level.WARNING, "Failed to connect to backend", future.cause());
+                    log.warn("Failed to connect to backend", future.cause());
                     ctx.close();
                     return;
                 }
@@ -66,7 +66,7 @@ final class MongoFrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-        log.log(Level.WARNING, "Frontend connection failed", cause);
+        log.warn("Frontend connection failed", cause);
         releasePending();
         MessagePump.closeOnFlush(backend);
         ctx.close();

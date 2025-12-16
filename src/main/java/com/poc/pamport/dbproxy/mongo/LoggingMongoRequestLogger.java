@@ -1,7 +1,7 @@
 package com.poc.pamport.dbproxy.mongo;
 
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.util.HexFormat;
 
 /**
@@ -13,7 +13,7 @@ public final class LoggingMongoRequestLogger implements MongoRequestLogger {
     private final boolean hexDump;
 
     public LoggingMongoRequestLogger() {
-        this(Logger.getLogger(LoggingMongoRequestLogger.class.getName()), true);
+        this(LoggerFactory.getLogger(LoggingMongoRequestLogger.class), true);
     }
 
     public LoggingMongoRequestLogger(Logger log, boolean hexDump) {
@@ -24,9 +24,9 @@ public final class LoggingMongoRequestLogger implements MongoRequestLogger {
     @Override
     public void onMessage(byte[] bytes) {
         if (hexDump) {
-            log.log(Level.INFO, "Mongo message {0} bytes: {1}", new Object[]{bytes.length, HEX.formatHex(bytes)});
+            log.info("Mongo message {} bytes: {}", bytes.length, HEX.formatHex(bytes));
         } else {
-            log.log(Level.INFO, "Mongo message {0} bytes", bytes.length);
+            log.info("Mongo message {} bytes", bytes.length);
         }
     }
 }

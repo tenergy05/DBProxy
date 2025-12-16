@@ -1,8 +1,8 @@
 package com.poc.pamport.dbproxy.cassandra;
 
 import java.util.HexFormat;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * LoggingCassandraRequestLogger dumps Cassandra frames (hex) for audit/debug.
@@ -13,7 +13,7 @@ public final class LoggingCassandraRequestLogger implements CassandraRequestLogg
     private final boolean hexDump;
 
     public LoggingCassandraRequestLogger() {
-        this(Logger.getLogger(LoggingCassandraRequestLogger.class.getName()), true);
+        this(LoggerFactory.getLogger(LoggingCassandraRequestLogger.class), true);
     }
 
     public LoggingCassandraRequestLogger(Logger log, boolean hexDump) {
@@ -24,9 +24,9 @@ public final class LoggingCassandraRequestLogger implements CassandraRequestLogg
     @Override
     public void onMessage(byte[] bytes) {
         if (hexDump) {
-            log.log(Level.INFO, "Cassandra message {0} bytes: {1}", new Object[]{bytes.length, HEX.formatHex(bytes)});
+            log.info("Cassandra message {} bytes: {}", bytes.length, HEX.formatHex(bytes));
         } else {
-            log.log(Level.INFO, "Cassandra message {0} bytes", bytes.length);
+            log.info("Cassandra message {} bytes", bytes.length);
         }
     }
 }
