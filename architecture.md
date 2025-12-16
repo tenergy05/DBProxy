@@ -1,7 +1,7 @@
 # DBProxy Architecture (Java/Netty Prototype)
 
 ## Goal
-Teleport-style database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
+Teleport-style(v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
 
 ## Top-Level Structure
 - **core**: DB-agnostic plumbing.
