@@ -1,7 +1,9 @@
 # DBProxy Architecture (Java/Netty Prototype)
 
 ## Goal
-Teleport-style (v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
+Teleport-style (v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JSON Web Token, JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
+
+Protocol selection is determined by the listener/engine or routing metadata, not by sniffing bytes.
 
 ## Top-Level Structure
 - **core**: DB-agnostic plumbing.
@@ -9,14 +11,14 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   - `BackendHandler`: streams backend → frontend.
   - `MessagePump`: ties lifecycles and flush-closes channels.
   - `audit/*`: `AuditRecorder`, `DbSession`, `Query`, `Result`, `LoggingAuditRecorder`.
-- **postgres**: PG-specific framing, parsing, proxy server.
-  - `PostgresProxyServer`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port; optional listener TLS via Netty `SslHandler`.
+- **postgres**: Postgres (PG)-specific framing, parsing, proxy server.
+  - `PostgresProxyServer`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port; optional listener TLS (Transport Layer Security) via Netty `SslHandler`.
   - `PostgresFrameDecoder`: PG frame splitter (startup vs typed messages). Public so other packages can reuse in pipelines.
   - `PgMessages`: PG frontend parsing (Startup/Cancel/Query/Parse/Bind/Execute/Password/Terminate) and helpers (encode query, auth ok/cleartext, error response).
   - `FrontendHandler`: parses client messages, validates JWT (PasswordMessage), resolves backend, forwards frames, emits audit.
   - `PostgresBackendAuditHandler`: inspects backend CommandComplete/ErrorResponse → audit result. Public ctor for cross-package pipeline wiring.
   - `QueryLogger`/`LoggingQueryLogger`: query inspection/rewrite hooks.
-  - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
+  - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Generic Security Services API, Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
 - **mongo**: Length-prefixed framing, passthrough proxy with request logger.
   - `MongoProxyServer`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
 - **cassandra**: Length-prefixed framing, passthrough proxy with request logger.
@@ -27,7 +29,7 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 - `jwtValidator` (Config) decides accept/reject. Default is permissive; replace with real JWT verification (signature, exp, claims).
 - On invalid JWT: sends PG `ErrorResponse` and closes.
 - On success: records session start in audit, then connects to backend and forwards traffic.
-- Mongo/Cassandra: currently only hex-logging; you can insert JWT validation before connecting (JWT must be supplied out of band, e.g., via agent/prelude).
+- Mongo/Cassandra: currently only hex-logging; JWT must be supplied out of band (agent/prelude) because these protocols lack a password-prompt phase like Postgres.
 
 ### Postgres Auth Modes
 - **Mode A (implemented):** proxy issues `AuthenticationCleartextPassword`; client sends JWT in `PasswordMessage`. Proxy validates JWT, authenticates to backend using route credentials, then completes client login.
@@ -52,10 +54,11 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
     "clientPrincipal": "svc-sales@EXAMPLE.COM"
   }
   ```
+- Route auth intent: today routes imply Kerberos/GSS (ticket cache) when Kerberos fields are set; password-based backend auth would require adding an explicit `auth` mode (future work).
 - Modify `TargetResolver` to decode JWT claims for richer routing.
 
 ## Audit Hooks
-- `AuditRecorder` mirrors Teleport semantics (`onSessionStart`, `onSessionEnd`, `onQuery`, `onResult`); default `LoggingAuditRecorder` logs JSON-like maps to SLF4J.
+- `AuditRecorder` mirrors Teleport semantics (`onSessionStart`, `onSessionEnd`, `onQuery`, `onResult`); default `LoggingAuditRecorder` logs JSON-like maps to SLF4J (Simple Logging Facade for Java).
 - PG: `FrontendHandler` emits `onSessionStart` on JWT success, `onQuery` for Query messages; `PostgresBackendAuditHandler` emits `onResult` on CommandComplete/ErrorResponse; `onSessionEnd` on disconnect.
 - Extend/replace `LoggingAuditRecorder` to send events to a real sink.
 
