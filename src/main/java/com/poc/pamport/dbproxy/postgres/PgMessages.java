@@ -12,6 +12,14 @@ public final class PgMessages {
 
     public interface PgMessage {}
 
+    public enum SSLRequest implements PgMessage {
+        INSTANCE
+    }
+
+    public enum GSSENCRequest implements PgMessage {
+        INSTANCE
+    }
+
     public static final class StartupMessage implements PgMessage {
         public final int major;
         public final int minor;
@@ -108,6 +116,62 @@ public final class PgMessages {
         INSTANCE
     }
 
+    public enum Sync implements PgMessage {
+        INSTANCE
+    }
+
+    public enum Flush implements PgMessage {
+        INSTANCE
+    }
+
+    public enum CopyDone implements PgMessage {
+        INSTANCE
+    }
+
+    public static final class CopyData implements PgMessage {
+        public final int payloadLength;
+
+        public CopyData(int payloadLength) {
+            this.payloadLength = payloadLength;
+        }
+    }
+
+    public static final class CopyFail implements PgMessage {
+        public final String message;
+
+        public CopyFail(String message) {
+            this.message = message;
+        }
+    }
+
+    public static final class Describe implements PgMessage {
+        public final char targetType;
+        public final String name;
+
+        public Describe(char targetType, String name) {
+            this.targetType = targetType;
+            this.name = name;
+        }
+    }
+
+    public static final class Close implements PgMessage {
+        public final char targetType;
+        public final String name;
+
+        public Close(char targetType, String name) {
+            this.targetType = targetType;
+            this.name = name;
+        }
+    }
+
+    public static final class FunctionCall implements PgMessage {
+        public final int argumentCount;
+
+        public FunctionCall(int argumentCount) {
+            this.argumentCount = argumentCount;
+        }
+    }
+
     public static final class PasswordMessage implements PgMessage {
         public final String password;
 
@@ -148,6 +212,10 @@ public final class PgMessages {
         ByteBuffer payload = buffer.slice(buffer.position(), payloadLength);
         return switch (type) {
             case 'Q' -> new Query(readCString(payload));
+            case 'D' -> parseDescribe(payload);
+            case 'C' -> parseClose(payload);
+            case 'S' -> Sync.INSTANCE;
+            case 'H' -> Flush.INSTANCE;
             case 'P' -> {
                 String statementName = readCString(payload);
                 String sql = readCString(payload);
@@ -178,11 +246,15 @@ public final class PgMessages {
                 }
                 yield new Bind(portal, statement, paramCount);
             }
+            case 'F' -> parseFunctionCall(payload);
             case 'E' -> {
                 String portal = readCString(payload);
                 int maxRows = payload.remaining() >= Integer.BYTES ? payload.getInt() : 0;
                 yield new Execute(portal, maxRows);
             }
+            case 'd' -> new CopyData(payload.remaining());
+            case 'c' -> CopyDone.INSTANCE;
+            case 'f' -> new CopyFail(readCString(payload));
             case 'X' -> Terminate.INSTANCE;
             case 'p' -> new PasswordMessage(readCString(payload));
             default -> new UnknownMessage(type);
@@ -195,6 +267,14 @@ public final class PgMessages {
         }
         int length = buffer.getInt();
         int code = buffer.getInt();
+        if (length == 8) {
+            if (code == 80877103) {
+                return SSLRequest.INSTANCE;
+            }
+            if (code == 80877104) {
+                return GSSENCRequest.INSTANCE;
+            }
+        }
         if (code == 80877102 && buffer.remaining() >= Integer.BYTES * 2) {
             int pid = buffer.getInt();
             int secret = buffer.getInt();
@@ -243,6 +323,12 @@ public final class PgMessages {
         return buf;
     }
 
+    public static ByteBuf sslNotSupported(ByteBufAllocator allocator) {
+        ByteBuf buf = allocator.buffer(1);
+        buf.writeByte((byte) 'N');
+        return buf;
+    }
+
     public static ByteBuf errorResponse(ByteBufAllocator allocator, String message) {
         byte[] msg = message.getBytes(StandardCharsets.UTF_8);
         int length = Integer.BYTES + 1 + msg.length + 1 + 1; // len + 'M'+msg+\0 + terminator\0
@@ -277,5 +363,50 @@ public final class PgMessages {
             buffer.get(); // consume terminating zero
         }
         return new String(data, StandardCharsets.UTF_8);
+    }
+
+    private static Describe parseDescribe(ByteBuffer payload) {
+        if (!payload.hasRemaining()) {
+            return new Describe('?', "");
+        }
+        char target = (char) payload.get();
+        String name = readCString(payload);
+        return new Describe(target, name);
+    }
+
+    private static Close parseClose(ByteBuffer payload) {
+        if (!payload.hasRemaining()) {
+            return new Close('?', "");
+        }
+        char target = (char) payload.get();
+        String name = readCString(payload);
+        return new Close(target, name);
+    }
+
+    private static FunctionCall parseFunctionCall(ByteBuffer payload) {
+        if (payload.remaining() < Integer.BYTES + Short.BYTES + Short.BYTES) {
+            return new FunctionCall(0);
+        }
+        payload.position(payload.position() + Integer.BYTES); // function OID
+        int formatCodeCount = Short.toUnsignedInt(payload.getShort());
+        for (int i = 0; i < formatCodeCount && payload.remaining() >= Short.BYTES; i++) {
+            payload.getShort();
+        }
+        int argCount = Short.toUnsignedInt(payload.getShort());
+        for (int i = 0; i < argCount && payload.remaining() >= Integer.BYTES; i++) {
+            int argLength = payload.getInt();
+            if (argLength > 0 && argLength <= payload.remaining()) {
+                payload.position(payload.position() + argLength);
+            } else if (argLength < 0) {
+                // NULL argument
+            } else {
+                break;
+            }
+        }
+        // result format code
+        if (payload.remaining() >= Short.BYTES) {
+            payload.getShort();
+        }
+        return new FunctionCall(argCount);
     }
 }

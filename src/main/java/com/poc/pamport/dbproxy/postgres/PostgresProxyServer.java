@@ -1,22 +1,27 @@
 package com.poc.pamport.dbproxy.postgres;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
+import com.poc.pamport.dbproxy.core.audit.DbSession;
+import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
-import java.util.Objects;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
-import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
-import com.poc.pamport.dbproxy.core.audit.DbSession;
-import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
-import java.util.function.Predicate;
-import java.util.Map;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Predicate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * PostgresProxyServer is a minimal Postgres-aware proxy that accepts client
@@ -143,6 +148,54 @@ public final class PostgresProxyServer implements AutoCloseable {
             return this;
         }
 
+        public static Config fromJson(Path path) {
+            try {
+                ObjectMapper mapper = new ObjectMapper()
+                    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+                String json = Files.readString(path);
+                FileConfig file = mapper.readValue(json, FileConfig.class);
+                Config cfg = new Config();
+                if (file.listenHost != null && !file.listenHost.isBlank()) {
+                    cfg.listenHost(file.listenHost);
+                }
+                if (file.listenPort != null) {
+                    cfg.listenPort(file.listenPort);
+                }
+                if (file.tls != null) {
+                    if (Boolean.TRUE.equals(file.tls.selfSigned)) {
+                        cfg.tlsSelfSigned();
+                    } else if (file.tls.certPath != null && file.tls.keyPath != null) {
+                        cfg.tls(file.tls.certPath, file.tls.keyPath);
+                    }
+                }
+                if (file.routes != null) {
+                    for (FileRoute route : file.routes) {
+                        if (route.database == null || route.host == null || route.port == null) {
+                            throw new IllegalArgumentException("route requires database, host, port");
+                        }
+                        cfg.addRoute(
+                            route.database,
+                            new Route(
+                                route.host,
+                                route.port,
+                                route.dbUser == null ? "postgres" : route.dbUser,
+                                route.dbName,
+                                route.caCertPath,
+                                route.serverName,
+                                route.krb5CcName,
+                                route.krb5ConfPath,
+                                route.clientPrincipal,
+                                route.servicePrincipal
+                            )
+                        );
+                    }
+                }
+                return cfg;
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Failed to load config from " + path, e);
+            }
+        }
+
         private SslContext tlsContext;
 
         public Config tls(String certPath, String keyPath) {
@@ -184,25 +237,52 @@ public final class PostgresProxyServer implements AutoCloseable {
     /**
      * Backend route with connection credentials.
      */
-        public record Route(
-            String host,
-            int port,
-            String dbUser,
-            String dbName,
-            String caCertPath,
-            String serverName,
-            String krb5CcName,
-            String krb5ConfPath,
-            String clientPrincipal,
-            String servicePrincipal
-        ) {}
+    public record Route(
+        String host,
+        int port,
+        String dbUser,
+        String dbName,
+        String caCertPath,
+        String serverName,
+        String krb5CcName,
+        String krb5ConfPath,
+        String clientPrincipal,
+        String servicePrincipal
+    ) {}
+
+    private static final class FileTls {
+        public String certPath;
+        public String keyPath;
+        public Boolean selfSigned;
+    }
+
+    private static final class FileRoute {
+        public String database;
+        public String host;
+        public Integer port;
+        public String dbUser;
+        public String dbName;
+        public String caCertPath;
+        public String serverName;
+        public String krb5CcName;
+        public String krb5ConfPath;
+        public String clientPrincipal;
+        public String servicePrincipal;
+    }
+
+    private static final class FileConfig {
+        public String listenHost;
+        public Integer listenPort;
+        public FileTls tls;
+        public List<FileRoute> routes;
+    }
 
     /**
      * Minimal launcher for local testing with defaults:
      * listen on 15432 and forward to localhost:26257 (CockroachDB default port).
      */
     public static void main(String[] args) throws InterruptedException {
-        Config config = new Config();
+        Config config = args.length > 0 ? Config.fromJson(Path.of(args[0])) : new Config();
         try (PostgresProxyServer server = new PostgresProxyServer(config)) {
             server.start();
             server.blockUntilShutdown();

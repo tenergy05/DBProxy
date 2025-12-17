@@ -44,10 +44,19 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 - PG: `FrontendHandler` emits `onSessionStart` on JWT success, `onQuery` for Query messages; `PostgresBackendAuditHandler` emits `onResult` on CommandComplete/ErrorResponse; `onSessionEnd` on disconnect.
 - Extend/replace `LoggingAuditRecorder` to send events to a real sink.
 
+## Local Config (JSON)
+- Load with `PostgresProxyServer.Config.fromJson(path)` or `java -jar .../dbproxy.jar /path/to/config.json` (main picks first arg).
+- Shape:
+  ```json
+  (see `src/main/resources/config.sample.json` for a complete example with TLS/Kerberos fields and 3 routes)
+  ```
+- Unknown fields are ignored; missing database/host/port per route cause a load error. `selfSigned: true` builds a self-signed listener TLS context; omit `tls` to disable listener TLS.
+
 ## Postgres Data Flow & Pipelines
 - **Frontend pipeline (client → proxy)**: optional TLS listener `SslHandler` (if configured) → `PostgresFrameDecoder(true)` → `FrontendHandler`. Decoder handles startup frame as length-prefixed without leading type, then typed messages.
 - **FrontendHandler path**:
-  - Parses messages with `PgMessages.parseFrontend`.
+  - Parses messages with `PgMessages.parseFrontend` (pgproto3-style structs).
+  - SSLRequest/GSSENCRequest: responds `N` (deny upgrade), keeps waiting for startup.
   - StartupMessage: capture `user`, `database`, `application_name` into `DbSession`.
   - PasswordMessage: treat password field as JWT, validate via `jwtValidator`; on success call `auditRecorder.onSessionStart`.
   - Query / Parse / Bind / Execute / Terminate: invoke `QueryLogger`; Query triggers optional rewrite and `auditRecorder.onQuery`.
@@ -72,9 +81,9 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   Connect with psql/JDBC/IntelliJ to proxy host/port, DB/user as normal; put JWT in password field.
 
 ## Postgres Protocol Coverage (Java prototype)
-- **Parsed / inspected in `FrontendHandler`**: StartupMessage, PasswordMessage, Query, Parse, Bind, Execute, Terminate. CancelRequest is parsed but only forwarded verbatim (no key validation). Unknown messages are passed through without inspection.
-- **Not parsed/handled**: SSLRequest (0x04D2162F), GSSENCRequest (0x04D21633), SASLInitialResponse/SASLResponse, Startup parameter status replies, Sync, Describe (portal/statement), Close (portal/statement), CopyIn/CopyOut/CopyData, FunctionCall, Flush, Suspicious length checks beyond basic bounds.
-- **TLS negotiation**: Listener TLS (if enabled) expects TLS from byte 0; PG-native SSLRequest/GSSENC negotiation is not implemented. Clients must be configured to connect with TLS pre-wrapped (or disable client-side SSL negotiation).
+- **Parsed / inspected in `FrontendHandler`**: SSLRequest/GSSENCRequest (responds `N`), StartupMessage, CancelRequest (forwarded verbatim), PasswordMessage, Query, Parse, Bind, Execute, Describe, Close, Sync, Flush, CopyData/CopyDone/CopyFail, FunctionCall, Terminate. Unknown messages are passed through without inspection.
+- **Not parsed/handled**: SASLInitialResponse/SASLResponse, Startup parameter status replies, CopyIn/CopyOut contents, portal/statement lifecycle state machine, ReadyForQuery semantics, compression, length guarding beyond basic bounds.
+- **TLS negotiation**: Listener TLS (if enabled) expects TLS from byte 0; SSLRequest/GSSENCRequest are explicitly denied (`N`) rather than upgrading. Clients needing TLS must be pre-wrapped (e.g., stunnel/ALB) or connect with sslmode=disable.
 - **Auth modes**: Only AuthenticationCleartextPassword challenge is emitted; no MD5/SCRAM/SASL support on frontend; backend auth is GSS (Kerberos) via `PgGssBackend`.
 - **Backend auditing**: `PostgresBackendAuditHandler` emits `onResult` on CommandComplete ('C') and ErrorResponse ('E'); all other backend messages are forwarded without audit semantics.
 - **Cancel flow**: Parsed CancelRequest is forwarded to whatever backend connection is opened for the session; Teleport Go handles proper cancel routing; Java prototype lacks PID/secret-key lookup and dedicated cancel listener.

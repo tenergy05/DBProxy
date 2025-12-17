@@ -1,0 +1,44 @@
+{
+  "listenHost": "0.0.0.0",
+  "listenPort": 15432,
+  "tls": {
+    "certPath": "/etc/dbproxy/dbproxy.crt",
+    "keyPath": "/etc/dbproxy/dbproxy.key",
+    "selfSigned": false
+  },
+  "routes": [
+    {
+      "database": "sales",
+      "host": "pg-sales.internal",
+      "port": 5432,
+      "dbUser": "sales_app",
+      "dbName": "sales",
+      "caCertPath": "/etc/dbproxy/pg-sales-ca.pem",
+      "serverName": "pg-sales.internal",
+      "servicePrincipal": "postgres/pg-sales.internal",
+      "krb5CcName": "/tmp/krb5cc_sales",
+      "krb5ConfPath": "/etc/krb5.conf",
+      "clientPrincipal": "svc-sales@EXAMPLE.COM"
+    },
+    {
+      "database": "hr",
+      "host": "pg-hr.internal",
+      "port": 5432,
+      "dbUser": "hr_app",
+      "dbName": "hr",
+      "caCertPath": "/etc/dbproxy/pg-hr-ca.pem",
+      "serverName": "pg-hr.internal",
+      "servicePrincipal": "postgres/pg-hr.internal",
+      "krb5CcName": "/tmp/krb5cc_hr",
+      "krb5ConfPath": "/etc/krb5.conf",
+      "clientPrincipal": "svc-hr@EXAMPLE.COM"
+    },
+    {
+      "database": "*",
+      "host": "127.0.0.1",
+      "port": 26257,
+      "dbUser": "postgres",
+      "dbName": "default"
+    }
+  ]
+}

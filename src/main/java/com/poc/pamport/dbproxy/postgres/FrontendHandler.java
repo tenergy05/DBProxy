@@ -44,16 +44,22 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-        PgMessages.PgMessage parsed = PgMessages.parseFrontend(msg, !startupSeen);
-        startupSeen = true;
-
+        boolean inStartupPhase = !startupSeen;
+        PgMessages.PgMessage parsed = PgMessages.parseFrontend(msg, inStartupPhase);
         ByteBuf outbound = msg;
         boolean reuseOriginal = true;
 
-        if (parsed instanceof PgMessages.StartupMessage startup) {
+        if (parsed == PgMessages.SSLRequest.INSTANCE || parsed == PgMessages.GSSENCRequest.INSTANCE) {
+            ctx.writeAndFlush(PgMessages.sslNotSupported(ctx.alloc()));
+            ReferenceCountUtil.safeRelease(msg);
+            return;
+        } else if (parsed instanceof PgMessages.StartupMessage startup) {
+            startupSeen = true;
             session.setDatabaseUser(startup.parameters.get("user"));
             session.setDatabaseName(startup.parameters.get("database"));
             session.setApplicationName(startup.parameters.get("application_name"));
+        } else if (parsed instanceof PgMessages.CancelRequest) {
+            startupSeen = true;
         } else if (parsed instanceof PgMessages.PasswordMessage password) {
             jwt = password.password;
             if (!jwtValidator.test(jwt)) {
