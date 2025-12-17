@@ -61,6 +61,8 @@ Protocol selection is determined by the listener/engine or routing metadata, not
 - `AuditRecorder` mirrors Teleport semantics (`onSessionStart`, `onSessionEnd`, `onQuery`, `onResult`); default `LoggingAuditRecorder` logs JSON-like maps to SLF4J (Simple Logging Facade for Java).
 - PG: `FrontendHandler` emits `onSessionStart` on JWT success, `onQuery` for Query messages; `PostgresBackendAuditHandler` emits `onResult` on CommandComplete/ErrorResponse; `onSessionEnd` on disconnect.
 - Extend/replace `LoggingAuditRecorder` to send events to a real sink.
+- Teleport parity: only session/query/result events are intended—no low-level protocol frames or auth handshakes are audited; passwords/SCRAM/TLS handshakes are never logged. Query text may need truncation/redaction in real deployments.
+- Logging details (default): `LoggingAuditRecorder` builds a `LinkedHashMap` with `session_id`, `client`, `db_user`, `db_name`, `app`, `start`, `ts`, plus event-specific fields (`event`, `query`, `parameters`, `affected`, `error`, `message`) and emits `toString()` at INFO via SLF4J. No truncation/redaction is applied; sensitive queries should be filtered upstream or replaced with a custom recorder.
 
 ## Local Config (JSON)
 - Default main loads `config.sample.json` from classpath; override by passing a path arg if needed.
