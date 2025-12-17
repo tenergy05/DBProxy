@@ -31,11 +31,11 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 
 ## Routing Model
 - `PostgresProxyServer.Config` exposes `TargetResolver` to choose backend host/port per connection, based on `DbSession` (user/db/app) and JWT string.
-- Convenience `addRoute(databaseName, HostPort)` with `*` default. Example:
+- Convenience `addRoute(databaseName, Route)` with `*` default. Example:
   ```java
   new PostgresProxyServer.Config()
-      .addRoute("sales", new HostPort("pg-sales.internal", 5432))
-      .addRoute("*", new HostPort("pg-default.internal", 5432));
+      .addRoute("sales", new PostgresProxyServer.Route("pg-sales.internal", 5432, "sales_user", "sales", null, null, null, null, null, null))
+      .addRoute("*", new PostgresProxyServer.Route("127.0.0.1", 26257, "postgres", null, null, null, null, null, null, null));
   ```
 - Modify `TargetResolver` to decode JWT claims for richer routing.
 
@@ -45,7 +45,8 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 - Extend/replace `LoggingAuditRecorder` to send events to a real sink.
 
 ## Local Config (JSON)
-- Load with `PostgresProxyServer.Config.fromJson(path)` or `java -jar .../dbproxy.jar /path/to/config.json` (main picks first arg).
+- Default main loads `config.sample.json` from classpath; override by passing a path arg if needed.
+- Load programmatically with `PostgresProxyServer.Config.fromJson(path)` or `fromClasspath("config.sample.json")`.
 - Shape:
   ```json
   (see `src/main/resources/config.sample.json` for a complete example with TLS/Kerberos fields and 3 routes)
@@ -71,13 +72,16 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   mvn -DskipTests package
   ```
   If ~/.m2 permissions are restricted, set an alternate repo: `mvn -Dmaven.repo.local=/tmp/m2 -DskipTests package`.
-- Run PG proxy (example):
-  ```java
-  var cfg = new PostgresProxyServer.Config()
-      .addRoute("*", new PostgresProxyServer.HostPort("127.0.0.1", 5432))
-      .jwtValidator(token -> true); // TODO real JWT check
-  new PostgresProxyServer(cfg).start();
-  ```
+- Run PG proxy (examples):
+  - Default (classpath config.sample.json): `java -jar target/dbproxy-0.1.0-SNAPSHOT.jar`
+  - Override config file: `java -jar target/dbproxy-0.1.0-SNAPSHOT.jar /path/to/config.json`
+  - Programmatic (for embedding):
+    ```java
+    var cfg = new PostgresProxyServer.Config()
+        .addRoute("*", new PostgresProxyServer.Route("127.0.0.1", 5432, "postgres", null, null, null, null, null, null, null))
+        .jwtValidator(token -> true); // TODO real JWT check
+    new PostgresProxyServer(cfg).start();
+    ```
   Connect with psql/JDBC/IntelliJ to proxy host/port, DB/user as normal; put JWT in password field.
 
 ## Postgres Protocol Coverage (Java prototype)
@@ -87,12 +91,12 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 - **Auth modes**: Only AuthenticationCleartextPassword challenge is emitted; no MD5/SCRAM/SASL support on frontend; backend auth is GSS (Kerberos) via `PgGssBackend`.
 - **Backend auditing**: `PostgresBackendAuditHandler` emits `onResult` on CommandComplete ('C') and ErrorResponse ('E'); all other backend messages are forwarded without audit semantics.
 - **Cancel flow**: Parsed CancelRequest is forwarded to whatever backend connection is opened for the session; Teleport Go handles proper cancel routing; Java prototype lacks PID/secret-key lookup and dedicated cancel listener.
-- **SSL / TLS differences vs Go**: Teleport’s Go DB engine performs PG SSL negotiation (responds 'S'/'N') and supports cancel protocol; this Java prototype currently requires out-of-band TLS and omits those negotiations.
+- **SSL / TLS differences vs Go**: Teleport’s Go DB engine performs PG SSL negotiation (responds 'S'/'N') and supports cancel protocol; this Java prototype either uses listener TLS from byte 0 or denies SSLRequest/GSSENC (`N`) and expects out-of-band TLS.
 
 ## Gaps vs Teleport Go Implementation
 - Reference Go engine: `teleport/lib/srv/db/postgres/engine.go` (uses `jackc/pgproto3` to fully parse frontend/backed messages, cancel flow, SASL/MD5/SCRAM auth, SSL negotiation).
-- Missing in Java prototype: PG SSLRequest/GSSENC negotiation responses, SASL/MD5/SCRAM auth flows, Describe/Close/Sync/Copy/Flush/FunctionCall handling, portal/statement lifecycle tracking, ready-for-query state machine, server ParameterStatus/BackendKeyData forwarding, cancel routing keyed by PID/secret, compression, pgproto-level validation.
-- Listener TLS in Java assumes TLS from byte 0; Go path speaks native PG SSL negotiation to decide TLS.
+- Missing in Java prototype: SASL/MD5/SCRAM auth flows, portal/statement lifecycle tracking + ready-for-query state machine, server ParameterStatus/BackendKeyData forwarding, cancel routing keyed by PID/secret, compression, pgproto-level validation. SSLRequest/GSSENC are denied (`N`) rather than upgrading.
+- Listener TLS in Java assumes TLS from byte 0 (or explicit denial); Go path speaks native PG SSL negotiation to decide TLS.
 - Backend auth: Java uses GSS ticket cache; Go supports DB-specific TLS (verify-full/verify-ca/insecure) and driver-side auth variants.
 - To reach Go-level coverage, Java frontend must grow a stateful PG protocol implementation or embed a pgproto3-equivalent; netty decode/encode currently inspects only a narrow subset.
 
@@ -108,7 +112,7 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 
 ## Protocol Notes (Postgres)
 - Frames: startup (length-prefixed, no type), then typed messages (type byte + length).
-- Auth: `AuthenticationCleartextPassword` prompt, accept `PasswordMessage` as JWT, then proceed. Frontend listener TLS still TODO; backend dialer uses TLS when configured via `PgGssBackend`.
+- Auth: `AuthenticationCleartextPassword` prompt, accept `PasswordMessage` as JWT, then proceed. Listener TLS is optional via config (no PG-level SSL negotiation; SSLRequest/GSSENC are denied); backend dialer uses TLS when configured via `PgGssBackend`.
 - Backend readiness: current code forwards client frames immediately; backend audit handler observes server replies.
 - Cancel requests: not implemented in Java skeleton yet (exists in Teleport Go).
 

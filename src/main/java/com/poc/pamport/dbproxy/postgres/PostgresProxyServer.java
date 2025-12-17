@@ -13,6 +13,7 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
@@ -154,46 +155,72 @@ public final class PostgresProxyServer implements AutoCloseable {
                     .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
                 String json = Files.readString(path);
                 FileConfig file = mapper.readValue(json, FileConfig.class);
-                Config cfg = new Config();
-                if (file.listenHost != null && !file.listenHost.isBlank()) {
-                    cfg.listenHost(file.listenHost);
-                }
-                if (file.listenPort != null) {
-                    cfg.listenPort(file.listenPort);
-                }
-                if (file.tls != null) {
-                    if (Boolean.TRUE.equals(file.tls.selfSigned)) {
-                        cfg.tlsSelfSigned();
-                    } else if (file.tls.certPath != null && file.tls.keyPath != null) {
-                        cfg.tls(file.tls.certPath, file.tls.keyPath);
-                    }
-                }
-                if (file.routes != null) {
-                    for (FileRoute route : file.routes) {
-                        if (route.database == null || route.host == null || route.port == null) {
-                            throw new IllegalArgumentException("route requires database, host, port");
-                        }
-                        cfg.addRoute(
-                            route.database,
-                            new Route(
-                                route.host,
-                                route.port,
-                                route.dbUser == null ? "postgres" : route.dbUser,
-                                route.dbName,
-                                route.caCertPath,
-                                route.serverName,
-                                route.krb5CcName,
-                                route.krb5ConfPath,
-                                route.clientPrincipal,
-                                route.servicePrincipal
-                            )
-                        );
-                    }
-                }
-                return cfg;
+                return fromFileConfig(file);
             } catch (Exception e) {
                 throw new IllegalArgumentException("Failed to load config from " + path, e);
             }
+        }
+
+        public static Config fromJson(InputStream stream) {
+            try {
+                ObjectMapper mapper = new ObjectMapper()
+                    .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+                FileConfig file = mapper.readValue(stream, FileConfig.class);
+                return fromFileConfig(file);
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Failed to load config from stream", e);
+            }
+        }
+
+        public static Config fromClasspath(String resourceName) {
+            InputStream in = PostgresProxyServer.class.getClassLoader().getResourceAsStream(resourceName);
+            if (in == null) {
+                throw new IllegalArgumentException("Resource not found: " + resourceName);
+            }
+            return fromJson(in);
+        }
+
+        private static Config fromFileConfig(FileConfig file) {
+            Config cfg = new Config();
+            if (file == null) {
+                return cfg;
+            }
+            if (file.listenHost != null && !file.listenHost.isBlank()) {
+                cfg.listenHost(file.listenHost);
+            }
+            if (file.listenPort != null) {
+                cfg.listenPort(file.listenPort);
+            }
+            if (file.tls != null) {
+                if (Boolean.TRUE.equals(file.tls.selfSigned)) {
+                    cfg.tlsSelfSigned();
+                } else if (file.tls.certPath != null && file.tls.keyPath != null) {
+                    cfg.tls(file.tls.certPath, file.tls.keyPath);
+                }
+            }
+            if (file.routes != null) {
+                for (FileRoute route : file.routes) {
+                    if (route.database == null || route.host == null || route.port == null) {
+                        throw new IllegalArgumentException("route requires database, host, port");
+                    }
+                    cfg.addRoute(
+                        route.database,
+                        new Route(
+                            route.host,
+                            route.port,
+                            route.dbUser == null ? "postgres" : route.dbUser,
+                            route.dbName,
+                            route.caCertPath,
+                            route.serverName,
+                            route.krb5CcName,
+                            route.krb5ConfPath,
+                            route.clientPrincipal,
+                            route.servicePrincipal
+                        )
+                    );
+                }
+            }
+            return cfg;
         }
 
         private SslContext tlsContext;
@@ -281,8 +308,13 @@ public final class PostgresProxyServer implements AutoCloseable {
      * Minimal launcher for local testing with defaults:
      * listen on 15432 and forward to localhost:26257 (CockroachDB default port).
      */
-    public static void main(String[] args) throws InterruptedException {
-        Config config = args.length > 0 ? Config.fromJson(Path.of(args[0])) : new Config();
+    public static void main(String[] args) throws Exception {
+        Config config;
+        if (args.length > 0) {
+            config = Config.fromJson(Path.of(args[0]));
+        } else {
+            config = Config.fromClasspath("config.sample.json");
+        }
         try (PostgresProxyServer server = new PostgresProxyServer(config)) {
             server.start();
             server.blockUntilShutdown();
