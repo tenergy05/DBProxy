@@ -10,12 +10,13 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   - `MessagePump`: ties lifecycles and flush-closes channels.
   - `audit/*`: `AuditRecorder`, `DbSession`, `Query`, `Result`, `LoggingAuditRecorder`.
 - **postgres**: PG-specific framing, parsing, proxy server.
-  - `PostgresProxyServer`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port.
-  - `PostgresFrameDecoder`: PG frame splitter (startup vs typed messages).
+  - `PostgresProxyServer`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port; optional listener TLS via Netty `SslHandler`.
+  - `PostgresFrameDecoder`: PG frame splitter (startup vs typed messages). Public so other packages can reuse in pipelines.
   - `PgMessages`: PG frontend parsing (Startup/Cancel/Query/Parse/Bind/Execute/Password/Terminate) and helpers (encode query, auth ok/cleartext, error response).
   - `FrontendHandler`: parses client messages, validates JWT (PasswordMessage), resolves backend, forwards frames, emits audit.
-  - `PostgresBackendAuditHandler`: inspects backend CommandComplete/ErrorResponse → audit result.
+  - `PostgresBackendAuditHandler`: inspects backend CommandComplete/ErrorResponse → audit result. Public ctor for cross-package pipeline wiring.
   - `QueryLogger`/`LoggingQueryLogger`: query inspection/rewrite hooks.
+  - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
 - **mongo**: Length-prefixed framing, passthrough proxy with request logger.
   - `MongoProxyServer`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
 - **cassandra**: Length-prefixed framing, passthrough proxy with request logger.
@@ -43,6 +44,18 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 - PG: `FrontendHandler` emits `onSessionStart` on JWT success, `onQuery` for Query messages; `PostgresBackendAuditHandler` emits `onResult` on CommandComplete/ErrorResponse; `onSessionEnd` on disconnect.
 - Extend/replace `LoggingAuditRecorder` to send events to a real sink.
 
+## Postgres Data Flow & Pipelines
+- **Frontend pipeline (client → proxy)**: optional TLS listener `SslHandler` (if configured) → `PostgresFrameDecoder(true)` → `FrontendHandler`. Decoder handles startup frame as length-prefixed without leading type, then typed messages.
+- **FrontendHandler path**:
+  - Parses messages with `PgMessages.parseFrontend`.
+  - StartupMessage: capture `user`, `database`, `application_name` into `DbSession`.
+  - PasswordMessage: treat password field as JWT, validate via `jwtValidator`; on success call `auditRecorder.onSessionStart`.
+  - Query / Parse / Bind / Execute / Terminate: invoke `QueryLogger`; Query triggers optional rewrite and `auditRecorder.onQuery`.
+  - Buffers frames until backend is connected; on failure sends `ErrorResponse` and closes.
+- **Backend connect**: `TargetResolver` selects `Route` (host/port/dbUser/dbName/TLS+Kerberos options). `PgGssBackend.connect` dials backend on frontend event loop.
+- **Backend pipeline (proxy → PG server)**: `SslHandler` (TLS 1.2/1.3 client) → `PostgresFrameDecoder(false)` → `PostgresBackendAuditHandler` → GSS handshake handler (AuthenticationGSS/GSSContinue, Password token writes) → `BackendHandler` (streaming).
+- **Linking**: After backend auth ok, `MessagePump.link(frontend, backend)` mirrors bytes both ways; `MessagePump.closeOnFlush` on disconnect.
+
 ## Build & Run
 - Maven (`pom.xml`, Java 17, Netty 4.1.108.Final). Build:
   ```bash
@@ -58,11 +71,47 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   ```
   Connect with psql/JDBC/IntelliJ to proxy host/port, DB/user as normal; put JWT in password field.
 
+## Postgres Protocol Coverage (Java prototype)
+- **Parsed / inspected in `FrontendHandler`**: StartupMessage, PasswordMessage, Query, Parse, Bind, Execute, Terminate. CancelRequest is parsed but only forwarded verbatim (no key validation). Unknown messages are passed through without inspection.
+- **Not parsed/handled**: SSLRequest (0x04D2162F), GSSENCRequest (0x04D21633), SASLInitialResponse/SASLResponse, Startup parameter status replies, Sync, Describe (portal/statement), Close (portal/statement), CopyIn/CopyOut/CopyData, FunctionCall, Flush, Suspicious length checks beyond basic bounds.
+- **TLS negotiation**: Listener TLS (if enabled) expects TLS from byte 0; PG-native SSLRequest/GSSENC negotiation is not implemented. Clients must be configured to connect with TLS pre-wrapped (or disable client-side SSL negotiation).
+- **Auth modes**: Only AuthenticationCleartextPassword challenge is emitted; no MD5/SCRAM/SASL support on frontend; backend auth is GSS (Kerberos) via `PgGssBackend`.
+- **Backend auditing**: `PostgresBackendAuditHandler` emits `onResult` on CommandComplete ('C') and ErrorResponse ('E'); all other backend messages are forwarded without audit semantics.
+- **Cancel flow**: Parsed CancelRequest is forwarded to whatever backend connection is opened for the session; Teleport Go handles proper cancel routing; Java prototype lacks PID/secret-key lookup and dedicated cancel listener.
+- **SSL / TLS differences vs Go**: Teleport’s Go DB engine performs PG SSL negotiation (responds 'S'/'N') and supports cancel protocol; this Java prototype currently requires out-of-band TLS and omits those negotiations.
+
+## Gaps vs Teleport Go Implementation
+- Reference Go engine: `teleport/lib/srv/db/postgres/engine.go` (uses `jackc/pgproto3` to fully parse frontend/backed messages, cancel flow, SASL/MD5/SCRAM auth, SSL negotiation).
+- Missing in Java prototype: PG SSLRequest/GSSENC negotiation responses, SASL/MD5/SCRAM auth flows, Describe/Close/Sync/Copy/Flush/FunctionCall handling, portal/statement lifecycle tracking, ready-for-query state machine, server ParameterStatus/BackendKeyData forwarding, cancel routing keyed by PID/secret, compression, pgproto-level validation.
+- Listener TLS in Java assumes TLS from byte 0; Go path speaks native PG SSL negotiation to decide TLS.
+- Backend auth: Java uses GSS ticket cache; Go supports DB-specific TLS (verify-full/verify-ca/insecure) and driver-side auth variants.
+- To reach Go-level coverage, Java frontend must grow a stateful PG protocol implementation or embed a pgproto3-equivalent; netty decode/encode currently inspects only a narrow subset.
+
+## Postgres Backend Connection (TLS + GSSAPI)
+- Backend path (after frontend JWT ok) can use `PgGssBackend.connect` to reach a PG server with TLS (client mode) and GSSAPI auth.
+- Backend pipeline: `SslHandler` (JDK provider, TLS 1.2/1.3) → `PostgresFrameDecoder(false)` → `PostgresBackendAuditHandler` → GSS handshake handler that exchanges AuthenticationGSS/Continue, sends password messages with GSS tokens, then swaps to `BackendHandler` for streaming.
+- GSS setup:
+  - Builds service principal from route (`servicePrincipal` or `postgres/<host>` default).
+  - Uses Kerberos ticket cache (`useTicketCache=true`, `doNotPrompt=true`); optional overrides via route: `krb5ConfPath`, `krb5CcName`, `clientPrincipal`.
+  - Wraps `Subject.doAs` around JGSS `initSecContext`; errors surfaced as `IllegalStateException` with the underlying cause.
+- TLS trust: route may specify `caCertPath` (trust anchor) and `serverName` (SNI/verification). Falls back to `InsecureTrustManagerFactory` when CA not provided.
+- On AuthenticationOk, links frontend/backend via `MessagePump` and emits audit via backend handler.
+
 ## Protocol Notes (Postgres)
 - Frames: startup (length-prefixed, no type), then typed messages (type byte + length).
-- Auth: `AuthenticationCleartextPassword` prompt, accept `PasswordMessage` as JWT, then proceed (no TLS yet).
+- Auth: `AuthenticationCleartextPassword` prompt, accept `PasswordMessage` as JWT, then proceed. Frontend listener TLS still TODO; backend dialer uses TLS when configured via `PgGssBackend`.
 - Backend readiness: current code forwards client frames immediately; backend audit handler observes server replies.
 - Cancel requests: not implemented in Java skeleton yet (exists in Teleport Go).
+
+## Mongo Path (Current)
+- Pipeline: `MongoFrameDecoder` (length-prefixed) → `MongoFrontendHandler`; `BackendConnector` dials backend with matching frame decoder and `BackendHandler`.
+- No auth/JWT/TLS implemented; proxy is plaintext passthrough with optional `MongoRequestLogger` that dumps requests in hex.
+- Missing features vs production: TLS to client/backend, scram/kerberos auth, structured command parsing/audit, compressions (snappy/zlib/zstd) awareness.
+
+## Cassandra Path (Current)
+- Pipeline: `CassandraFrameDecoder` (length-prefixed) → `CassandraFrontendHandler`; `BackendConnector` mirrors to backend decoder/handler.
+- No auth/JWT/TLS; passthrough with `CassandraRequestLogger` hex dumps.
+- Missing features: TLS on listener/backend, native protocol version negotiation, startup/auth flow parsing, tracing/audit hooks beyond hex log, compression flags.
 
 ## Extension Points / TODO
 - Implement real JWT validation (signature, exp, audience) and map claims to routing + session metadata.
