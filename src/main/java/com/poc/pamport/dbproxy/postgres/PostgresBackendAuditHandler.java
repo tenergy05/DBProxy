@@ -14,13 +14,13 @@ import org.slf4j.LoggerFactory;
 /**
  * PostgresBackendAuditHandler inspects backend responses to emit OnResult audit events.
  */
-final class PostgresBackendAuditHandler extends SimpleChannelInboundHandler<ByteBuf> {
+public final class PostgresBackendAuditHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private static final Logger log = LoggerFactory.getLogger(PostgresBackendAuditHandler.class);
 
     private final AuditRecorder audit;
     private final DbSession session;
 
-    PostgresBackendAuditHandler(AuditRecorder audit, DbSession session) {
+    public PostgresBackendAuditHandler(AuditRecorder audit, DbSession session) {
         this.audit = audit;
         this.session = session;
     }

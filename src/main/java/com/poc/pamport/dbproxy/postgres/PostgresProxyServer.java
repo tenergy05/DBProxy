@@ -8,6 +8,9 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
+import io.netty.handler.ssl.util.SelfSignedCertificate;
 import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
 import com.poc.pamport.dbproxy.core.audit.DbSession;
 import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
@@ -48,6 +51,9 @@ public final class PostgresProxyServer implements AutoCloseable {
                 @Override
                 protected void initChannel(SocketChannel ch) {
                     DbSession session = DbSession.from(ch.remoteAddress());
+                    if (config.tlsContext != null) {
+                        ch.pipeline().addLast("ssl", config.tlsContext.newHandler(ch.alloc()));
+                    }
                     ch.pipeline().addLast("pgFrameDecoder", new PostgresFrameDecoder(true));
                     Predicate<String> jwtValidator = config.jwtValidator;
                     ch.pipeline().addLast("frontendHandler", new FrontendHandler(config.targetResolver, config.queryLogger, config.auditRecorder, session, jwtValidator));
@@ -85,12 +91,15 @@ public final class PostgresProxyServer implements AutoCloseable {
     public static final class Config {
         String listenHost = "0.0.0.0";
         int listenPort = 15432;
-        Map<String, HostPort> staticRoutes = new HashMap<>();
+        Map<String, Route> staticRoutes = new HashMap<>();
         TargetResolver targetResolver = (session, jwt) -> {
             if (session.getDatabaseName() != null && staticRoutes.containsKey(session.getDatabaseName())) {
                 return staticRoutes.get(session.getDatabaseName());
             }
-            return staticRoutes.getOrDefault("*", new HostPort("127.0.0.1", 26257));
+            return staticRoutes.getOrDefault(
+                "*",
+                new Route("127.0.0.1", 26257, "postgres", session.getDatabaseName(),
+                    null, null, null, null, null, null));
         };
         QueryLogger queryLogger = new LoggingQueryLogger();
         AuditRecorder auditRecorder = new LoggingAuditRecorder();
@@ -114,8 +123,8 @@ public final class PostgresProxyServer implements AutoCloseable {
         /**
          * Add a static route keyed by database name; use "*" for default.
          */
-        public Config addRoute(String databaseName, HostPort hostPort) {
-            this.staticRoutes.put(Objects.requireNonNull(databaseName), Objects.requireNonNull(hostPort));
+        public Config addRoute(String databaseName, Route route) {
+            this.staticRoutes.put(Objects.requireNonNull(databaseName), Objects.requireNonNull(route));
             return this;
         }
 
@@ -133,6 +142,35 @@ public final class PostgresProxyServer implements AutoCloseable {
             this.jwtValidator = Objects.requireNonNull(jwtValidator);
             return this;
         }
+
+        private SslContext tlsContext;
+
+        public Config tls(String certPath, String keyPath) {
+            try {
+                if (certPath == null || certPath.isBlank() || keyPath == null || keyPath.isBlank()) {
+                    this.tlsContext = null;
+                    return this;
+                }
+                this.tlsContext = SslContextBuilder.forServer(new java.io.File(certPath), new java.io.File(keyPath))
+                    .protocols("TLSv1.2", "TLSv1.3")
+                    .build();
+                return this;
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Failed to build TLS context", e);
+            }
+        }
+
+        public Config tlsSelfSigned() {
+            try {
+                SelfSignedCertificate ssc = new SelfSignedCertificate();
+                this.tlsContext = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                    .protocols("TLSv1.2", "TLSv1.3")
+                    .build();
+                return this;
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Failed to build self-signed TLS context", e);
+            }
+        }
     }
 
     /**
@@ -140,13 +178,24 @@ public final class PostgresProxyServer implements AutoCloseable {
      */
     @FunctionalInterface
     public interface TargetResolver {
-        HostPort resolve(DbSession session, String jwt);
+        Route resolve(DbSession session, String jwt);
     }
 
     /**
-     * Simple holder for host/port pairs.
+     * Backend route with connection credentials.
      */
-    public record HostPort(String host, int port) {}
+        public record Route(
+            String host,
+            int port,
+            String dbUser,
+            String dbName,
+            String caCertPath,
+            String serverName,
+            String krb5CcName,
+            String krb5ConfPath,
+            String clientPrincipal,
+            String servicePrincipal
+        ) {}
 
     /**
      * Minimal launcher for local testing with defaults:

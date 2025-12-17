@@ -13,12 +13,12 @@ import java.util.List;
  * and the regular messages (type byte followed by length that includes the
  * length field but excludes the leading type).</p>
  */
-final class PostgresFrameDecoder extends ByteToMessageDecoder {
+public final class PostgresFrameDecoder extends ByteToMessageDecoder {
 
     private final boolean expectStartupMessage;
     private boolean startupProcessed;
 
-    PostgresFrameDecoder(boolean expectStartupMessage) {
+    public PostgresFrameDecoder(boolean expectStartupMessage) {
         this.expectStartupMessage = expectStartupMessage;
     }
 

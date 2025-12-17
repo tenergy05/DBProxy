@@ -1,7 +1,7 @@
 # DBProxy Architecture (Java/Netty Prototype)
 
 ## Goal
-Teleport-style(v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
+Teleport-style (v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
 
 ## Top-Level Structure
 - **core**: DB-agnostic plumbing.
@@ -39,7 +39,7 @@ Teleport-style(v18.5.1) database proxy in Java that preserves native wire protoc
 - Modify `TargetResolver` to decode JWT claims for richer routing.
 
 ## Audit Hooks
-- `AuditRecorder` mirrors Teleport semantics (`onSessionStart`, `onSessionEnd`, `onQuery`, `onResult`); default `LoggingAuditRecorder` logs JSON-like maps to JUL.
+- `AuditRecorder` mirrors Teleport semantics (`onSessionStart`, `onSessionEnd`, `onQuery`, `onResult`); default `LoggingAuditRecorder` logs JSON-like maps to SLF4J.
 - PG: `FrontendHandler` emits `onSessionStart` on JWT success, `onQuery` for Query messages; `PostgresBackendAuditHandler` emits `onResult` on CommandComplete/ErrorResponse; `onSessionEnd` on disconnect.
 - Extend/replace `LoggingAuditRecorder` to send events to a real sink.
 
@@ -70,3 +70,28 @@ Teleport-style(v18.5.1) database proxy in Java that preserves native wire protoc
 - Implement PG cancel flow and fuller message coverage in `PostgresBackendAuditHandler`.
 - Mongo/Cassandra: add auth and structured parsing for audit; today they are length-framed pass-through with hex logging.
 - Replace `LoggingAuditRecorder` with Teleport-compatible emitter if integrating back to Teleport services.
+
+## Parallels to Teleport’s Implementation
+- Client side (Teleport tsh): opens a local TCP listener per database, authenticates to Teleport Proxy over mTLS using Teleport-issued client certs/ALPN/SNI, and forwards raw DB protocol. tsh does not parse Postgres/Mongo/Cassandra.
+- Proxy side (Teleport Proxy): accepts DB protocol, authorizes Teleport identity, forwards startup to DB service over reverse tunnel, streams bytes; it does not handle target DB TLS.
+- DB service side (Teleport engines): protocol-aware; parses startup, RBAC check, optional auto user provision, connects to actual DB using per-DB TLS config, sends protocol auth OK to the client, relays messages, emits audit events.
+- Per-DB TLS (Teleport): `Auth.GetTLSConfig` builds a `tls.Config` per Database resource. Uses DB-specific CA (from resource or cloud roots), sets ServerName/mode (verify-full/verify-ca/insecure), and for on-prem generates a client cert from Teleport’s CA. TLS is applied per session when dialing the backend DB; clients remain unaware.
+- Session tracking/audit (Teleport): emitted on DB service side (session start/end, query, result); proxy keeps connections open and streams.
+
+## Proposed JWT-Based tsh Replacement
+- Goal: replace Teleport’s mTLS hop with JWT while keeping native DB protocols unchanged.
+- Agent (Python/Java):
+  - Start a local listener per DB (cockroach1, cockroach2, mongo, etc.).
+  - On accept, connect to the Java proxy and authenticate with JWT (either prelude or responding to PG AuthenticationCleartextPassword with PasswordMessage carrying JWT).
+  - Forward bytes after auth; no protocol parsing required in the agent.
+  - Optionally wrap agent→proxy in server-only TLS to protect JWT in transit.
+- Proxy:
+  - Validate JWT (replace `jwtValidator` stub).
+  - Resolve backend via `TargetResolver` (optionally decode JWT claims).
+  - Connect to backend DB with per-DB TLS, send protocol auth OK, stream traffic.
+  - Emit audit events (session start/end, query, result).
+
+## Session Tracking (Current Java Proxy)
+- Per connection: `DbSession` (ID, start time, client address, db/user/app from PG startup).
+- `onSessionStart` on successful JWT validation; `onSessionEnd` on disconnect.
+- PG: `onQuery` on Query messages; `onResult` on backend CommandComplete/ErrorResponse via `PostgresBackendAuditHandler`.

@@ -7,17 +7,17 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-final class PgMessages {
+public final class PgMessages {
     private PgMessages() {}
 
-    interface PgMessage {}
+    public interface PgMessage {}
 
-    static final class StartupMessage implements PgMessage {
-        final int major;
-        final int minor;
-        final Map<String, String> parameters;
+    public static final class StartupMessage implements PgMessage {
+        public final int major;
+        public final int minor;
+        public final Map<String, String> parameters;
 
-        StartupMessage(int major, int minor, Map<String, String> parameters) {
+        public StartupMessage(int major, int minor, Map<String, String> parameters) {
             this.major = major;
             this.minor = minor;
             this.parameters = parameters;
@@ -29,11 +29,11 @@ final class PgMessages {
         }
     }
 
-    static final class CancelRequest implements PgMessage {
-        final int backendPid;
-        final int secretKey;
+    public static final class CancelRequest implements PgMessage {
+        public final int backendPid;
+        public final int secretKey;
 
-        CancelRequest(int backendPid, int secretKey) {
+        public CancelRequest(int backendPid, int secretKey) {
             this.backendPid = backendPid;
             this.secretKey = secretKey;
         }
@@ -44,10 +44,10 @@ final class PgMessages {
         }
     }
 
-    static final class Query implements PgMessage {
-        final String sql;
+    public static final class Query implements PgMessage {
+        public final String sql;
 
-        Query(String sql) {
+        public Query(String sql) {
             this.sql = sql;
         }
 
@@ -57,11 +57,11 @@ final class PgMessages {
         }
     }
 
-    static final class Parse implements PgMessage {
-        final String statementName;
-        final String query;
+    public static final class Parse implements PgMessage {
+        public final String statementName;
+        public final String query;
 
-        Parse(String statementName, String query) {
+        public Parse(String statementName, String query) {
             this.statementName = statementName;
             this.query = query;
         }
@@ -72,12 +72,12 @@ final class PgMessages {
         }
     }
 
-    static final class Bind implements PgMessage {
-        final String portal;
-        final String statement;
-        final int parameterCount;
+    public static final class Bind implements PgMessage {
+        public final String portal;
+        public final String statement;
+        public final int parameterCount;
 
-        Bind(String portal, String statement, int parameterCount) {
+        public Bind(String portal, String statement, int parameterCount) {
             this.portal = portal;
             this.statement = statement;
             this.parameterCount = parameterCount;
@@ -89,11 +89,11 @@ final class PgMessages {
         }
     }
 
-    static final class Execute implements PgMessage {
-        final String portal;
-        final int maxRows;
+    public static final class Execute implements PgMessage {
+        public final String portal;
+        public final int maxRows;
 
-        Execute(String portal, int maxRows) {
+        public Execute(String portal, int maxRows) {
             this.portal = portal;
             this.maxRows = maxRows;
         }
@@ -104,22 +104,22 @@ final class PgMessages {
         }
     }
 
-    enum Terminate implements PgMessage {
+    public enum Terminate implements PgMessage {
         INSTANCE
     }
 
-    static final class PasswordMessage implements PgMessage {
-        final String password;
+    public static final class PasswordMessage implements PgMessage {
+        public final String password;
 
-        PasswordMessage(String password) {
+        public PasswordMessage(String password) {
             this.password = password;
         }
     }
 
-    static final class UnknownMessage implements PgMessage {
-        final char type;
+    public static final class UnknownMessage implements PgMessage {
+        public final char type;
 
-        UnknownMessage(char type) {
+        public UnknownMessage(char type) {
             this.type = type;
         }
 
@@ -129,7 +129,7 @@ final class PgMessages {
         }
     }
 
-    static PgMessage parseFrontend(ByteBuf frame, boolean startupFrame) {
+    public static PgMessage parseFrontend(ByteBuf frame, boolean startupFrame) {
         ByteBuffer buffer = frame.nioBuffer(frame.readerIndex(), frame.readableBytes());
         if (startupFrame) {
             return parseStartupOrCancel(buffer);
@@ -215,7 +215,7 @@ final class PgMessages {
         return new StartupMessage(major, minor, params);
     }
 
-    static ByteBuf encodeQuery(String sql, ByteBufAllocator allocator) {
+    public static ByteBuf encodeQuery(String sql, ByteBufAllocator allocator) {
         byte[] utf8 = sql.getBytes(StandardCharsets.UTF_8);
         int length = Integer.BYTES + utf8.length + 1; // length includes self, excludes leading type.
         ByteBuf buf = allocator.buffer(1 + length);
@@ -226,7 +226,7 @@ final class PgMessages {
         return buf;
     }
 
-    static ByteBuf authenticationOk(ByteBufAllocator allocator) {
+    public static ByteBuf authenticationOk(ByteBufAllocator allocator) {
         int length = Integer.BYTES; // only length field for AuthenticationOk
         ByteBuf buf = allocator.buffer(1 + length);
         buf.writeByte((byte) 'R');
@@ -234,7 +234,7 @@ final class PgMessages {
         return buf;
     }
 
-    static ByteBuf authenticationCleartext(ByteBufAllocator allocator) {
+    public static ByteBuf authenticationCleartext(ByteBufAllocator allocator) {
         int length = Integer.BYTES + Integer.BYTES; // length + auth code
         ByteBuf buf = allocator.buffer(1 + length);
         buf.writeByte((byte) 'R');
@@ -243,7 +243,7 @@ final class PgMessages {
         return buf;
     }
 
-    static ByteBuf errorResponse(ByteBufAllocator allocator, String message) {
+    public static ByteBuf errorResponse(ByteBufAllocator allocator, String message) {
         byte[] msg = message.getBytes(StandardCharsets.UTF_8);
         int length = Integer.BYTES + 1 + msg.length + 1 + 1; // len + 'M'+msg+\0 + terminator\0
         ByteBuf buf = allocator.buffer(1 + length);

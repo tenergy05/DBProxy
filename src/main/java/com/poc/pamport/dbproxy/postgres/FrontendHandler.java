@@ -1,11 +1,11 @@
 package com.poc.pamport.dbproxy.postgres;
 
 import com.poc.pamport.dbproxy.core.BackendHandler;
-import com.poc.pamport.dbproxy.core.BackendConnector;
 import com.poc.pamport.dbproxy.core.MessagePump;
 import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
 import com.poc.pamport.dbproxy.core.audit.DbSession;
 import com.poc.pamport.dbproxy.core.audit.Query;
+import com.poc.pamport.dbproxy.postgres.auth.PgGssBackend;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.socket.SocketChannel;
@@ -30,7 +30,6 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final Predicate<String> jwtValidator;
     private final PostgresProxyServer.TargetResolver targetResolver;
     private final List<ByteBuf> pending = new ArrayList<>();
-    private BackendConnector connector;
     private Channel backend;
     private boolean startupSeen;
     private String jwt;
@@ -108,33 +107,22 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (backend != null) {
             return;
         }
-        PostgresProxyServer.HostPort hp = targetResolver.resolve(session, jwt);
-        if (hp == null) {
+        PostgresProxyServer.Route route = targetResolver.resolve(session, jwt);
+        if (route == null) {
             ctx.writeAndFlush(PgMessages.errorResponse(ctx.alloc(), "No route for database"))
                 .addListener(ChannelFutureListener.CLOSE);
             return;
         }
-        connector = new BackendConnector(hp.host(), hp.port(), frontendChannel -> new ChannelInitializer<SocketChannel>() {
-            @Override
-            protected void initChannel(SocketChannel backendCh) {
-                backendCh.pipeline().addLast("pgFrameDecoder", new PostgresFrameDecoder(false));
-                backendCh.pipeline().addLast("backendAudit", new PostgresBackendAuditHandler(auditRecorder, session));
-                backendCh.pipeline().addLast("backendHandler", new BackendHandler(frontendChannel));
-            }
+        PgGssBackend.connect(ctx, route, session, auditRecorder, client -> {
+            backend = client;
+            MessagePump.link(ctx.channel(), backend);
+            flushPending();
+        }, error -> {
+            log.warn("Failed to connect/authenticate to backend", error);
+            auditRecorder.onSessionStart(session, error);
+            ctx.writeAndFlush(PgMessages.errorResponse(ctx.alloc(), "Backend connection failed"))
+                .addListener(ChannelFutureListener.CLOSE);
         });
-
-        connector.connect(ctx.channel())
-            .addListener((ChannelFutureListener) future -> {
-                if (!future.isSuccess()) {
-                    log.warn("Failed to connect to backend", future.cause());
-                    auditRecorder.onSessionStart(session, future.cause());
-                    ctx.close();
-                    return;
-                }
-                backend = future.channel();
-                MessagePump.link(ctx.channel(), backend);
-                flushPending();
-            });
     }
 
     private void flushPending() {
