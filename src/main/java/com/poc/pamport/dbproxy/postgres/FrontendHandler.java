@@ -48,6 +48,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         PgMessages.PgMessage parsed = PgMessages.parseFrontend(msg, inStartupPhase);
         ByteBuf outbound = msg;
         boolean reuseOriginal = true;
+        boolean shouldForward = true;
 
         if (parsed == PgMessages.SSLRequest.INSTANCE || parsed == PgMessages.GSSENCRequest.INSTANCE) {
             ctx.writeAndFlush(PgMessages.sslNotSupported(ctx.alloc()));
@@ -68,6 +69,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 return;
             }
             auditRecorder.onSessionStart(session, null);
+            shouldForward = false; // consume PasswordMessage (JWT) locally; never send to backend.
         } else if (parsed instanceof PgMessages.Query query) {
             String rewritten = queryLogger.onQuery(query.sql);
             if (!rewritten.equals(query.sql)) {
@@ -86,12 +88,16 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         }
 
         if (backend == null) {
-            pending.add(reuseOriginal ? outbound.retain() : outbound);
+            if (shouldForward) {
+                pending.add(reuseOriginal ? outbound.retain() : outbound);
+            }
             maybeConnect(ctx);
             return;
         }
 
-        backend.writeAndFlush(reuseOriginal ? outbound.retain() : outbound);
+        if (shouldForward) {
+            backend.writeAndFlush(reuseOriginal ? outbound.retain() : outbound);
+        }
     }
 
     @Override

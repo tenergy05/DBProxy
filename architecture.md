@@ -27,7 +27,7 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 - `jwtValidator` (Config) decides accept/reject. Default is permissive; replace with real JWT verification (signature, exp, claims).
 - On invalid JWT: sends PG `ErrorResponse` and closes.
 - On success: records session start in audit, then connects to backend and forwards traffic.
-- Mongo/Cassandra: currently only hex-logging; you can insert JWT validation before connecting.
+- Mongo/Cassandra: currently only hex-logging; you can insert JWT validation before connecting (JWT must be supplied out of band, e.g., via agent/prelude).
 
 ### Postgres Auth Modes
 - **Mode A (implemented):** proxy issues `AuthenticationCleartextPassword`; client sends JWT in `PasswordMessage`. Proxy validates JWT, authenticates to backend using route credentials, then completes client login.
@@ -36,11 +36,21 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
 
 ## Routing Model
 - `PostgresProxyServer.Config` exposes `TargetResolver` to choose backend target (host/port + auth material) per connection, based on `DbSession` (user/db/app) and JWT string.
-- Convenience `addRoute(databaseName, Route)` with `*` default. Example:
-  ```java
-  new PostgresProxyServer.Config()
-      .addRoute("sales", new PostgresProxyServer.Route("pg-sales.internal", 5432, "sales_user", "sales", null, null, null, null, null, null))
-      .addRoute("*", new PostgresProxyServer.Route("127.0.0.1", 26257, "postgres", null, null, null, null, null, null, null));
+- Convenience `addRoute(databaseName, Route)` with `*` default. Example (JSON is easiest; see `src/main/resources/config.sample.json`):
+  ```json
+  {
+    "database": "sales",
+    "host": "pg-sales.internal",
+    "port": 5432,
+    "dbUser": "sales_user",
+    "dbName": "sales",
+    "caCertPath": "/etc/dbproxy/pg-sales-ca.pem",
+    "serverName": "pg-sales.internal",
+    "servicePrincipal": "postgres/pg-sales.internal",
+    "krb5CcName": "/tmp/krb5cc_sales",
+    "krb5ConfPath": "/etc/krb5.conf",
+    "clientPrincipal": "svc-sales@EXAMPLE.COM"
+  }
   ```
 - Modify `TargetResolver` to decode JWT claims for richer routing.
 
@@ -69,7 +79,7 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   - Buffers frames until backend is connected and authenticated; on failure sends `ErrorResponse` and closes.
 - **Backend connect**: `TargetResolver` selects `Route` (host/port/dbUser/dbName/TLS+Kerberos options). `PgGssBackend.connect` dials backend on frontend event loop.
 - **Backend pipeline (proxy → PG server)**: `SslHandler` (TLS 1.2/1.3 client) → `PostgresFrameDecoder(false)` → `PostgresBackendAuditHandler` → GSS handshake handler (AuthenticationGSS/GSSContinue, Password token writes) → `BackendHandler` (streaming).
-- **Linking**: After backend auth ok, `MessagePump.link(frontend, backend)` mirrors bytes both ways; `MessagePump.closeOnFlush` on disconnect. Pending frontend frames are flushed only after backend auth succeeds.
+- **Linking**: After backend auth ok, the proxy forwards backend AuthenticationOk/BackendKeyData/ParameterStatus/ReadyForQuery to the client, then `MessagePump.link(frontend, backend)` mirrors bytes both ways; `MessagePump.closeOnFlush` on disconnect. Pending frontend frames are flushed only after backend auth succeeds.
 
 ## Build & Run
 - Maven (`pom.xml`, Java 17, Netty 4.1.108.Final). Build:
@@ -113,6 +123,7 @@ Teleport-style (v18.5.1) database proxy in Java that preserves native wire proto
   - Uses Kerberos ticket cache (`useTicketCache=true`, `doNotPrompt=true`); optional overrides via route: `krb5ConfPath`, `krb5CcName`, `clientPrincipal`.
   - Wraps `Subject.doAs` around JGSS `initSecContext`; errors surfaced as `IllegalStateException` with the underlying cause.
 - TLS trust: route may specify `caCertPath` (trust anchor) and `serverName` (SNI/verification). Falls back to `InsecureTrustManagerFactory` when CA not provided (dev-only; provide a CA or system trust for production).
+- Backends configured for SCRAM-only auth are not supported unless GSS is enabled; adding backend SCRAM is future work.
 - On AuthenticationOk, links frontend/backend via `MessagePump` and emits audit via backend handler.
 
 ## Protocol Notes (Postgres)
