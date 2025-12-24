@@ -11,6 +11,16 @@ public final class Session {
     private final String id;
     private final Instant startTime;
     private final String clientAddress;
+    // Teleport-like fields (simplified types to avoid external deps)
+    private String clusterName;
+    private String hostId;
+    private String databaseService;
+    private String identityUser;
+    private String autoCreateUserMode;
+    private java.util.List<String> databaseRoles = java.util.Collections.emptyList();
+    private java.util.Map<String, String> startupParameters = java.util.Collections.emptyMap();
+    private long postgresPid;
+    private String userAgent;
     private String databaseUser;
     private String databaseName;
     private String applicationName;
@@ -71,5 +81,77 @@ public final class Session {
 
     public void setProtocol(String protocol) {
         this.protocol = protocol;
+    }
+
+    public String getClusterName() {
+        return clusterName;
+    }
+
+    public void setClusterName(String clusterName) {
+        this.clusterName = clusterName;
+    }
+
+    public String getHostId() {
+        return hostId;
+    }
+
+    public void setHostId(String hostId) {
+        this.hostId = hostId;
+    }
+
+    public String getDatabaseService() {
+        return databaseService;
+    }
+
+    public void setDatabaseService(String databaseService) {
+        this.databaseService = databaseService;
+    }
+
+    public String getIdentityUser() {
+        return identityUser;
+    }
+
+    public void setIdentityUser(String identityUser) {
+        this.identityUser = identityUser;
+    }
+
+    public String getAutoCreateUserMode() {
+        return autoCreateUserMode;
+    }
+
+    public void setAutoCreateUserMode(String autoCreateUserMode) {
+        this.autoCreateUserMode = autoCreateUserMode;
+    }
+
+    public java.util.List<String> getDatabaseRoles() {
+        return databaseRoles;
+    }
+
+    public void setDatabaseRoles(java.util.List<String> databaseRoles) {
+        this.databaseRoles = databaseRoles == null ? java.util.Collections.emptyList() : databaseRoles;
+    }
+
+    public java.util.Map<String, String> getStartupParameters() {
+        return startupParameters;
+    }
+
+    public void setStartupParameters(java.util.Map<String, String> startupParameters) {
+        this.startupParameters = startupParameters == null ? java.util.Collections.emptyMap() : startupParameters;
+    }
+
+    public long getPostgresPid() {
+        return postgresPid;
+    }
+
+    public void setPostgresPid(long postgresPid) {
+        this.postgresPid = postgresPid;
+    }
+
+    public String getUserAgent() {
+        return userAgent;
+    }
+
+    public void setUserAgent(String userAgent) {
+        this.userAgent = userAgent;
     }
 }
