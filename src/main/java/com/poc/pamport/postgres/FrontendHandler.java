@@ -62,7 +62,6 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
             startupSeen = true;
         } else if (parsed instanceof PgMessages.PasswordMessage password) {
             // Client password is ignored; proxy owns backend auth.
-            shouldForward = false;
             ReferenceCountUtil.release(msg);
             return;
         } else if (parsed instanceof PgMessages.Query query) {
@@ -84,14 +83,20 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
         if (backend == null) {
             if (shouldForward) {
-                pending.add(reuseOriginal ? outbound.retain() : outbound);
+                // Pass ownership to pending list
+                pending.add(reuseOriginal ? msg : outbound);
+            } else if (reuseOriginal) {
+                ReferenceCountUtil.release(msg);
             }
             maybeConnect(ctx);
             return;
         }
 
         if (shouldForward) {
-            backend.writeAndFlush(reuseOriginal ? outbound.retain() : outbound);
+            // Pass ownership to channel
+            backend.writeAndFlush(reuseOriginal ? msg : outbound);
+        } else if (reuseOriginal) {
+            ReferenceCountUtil.release(msg);
         }
     }
 
