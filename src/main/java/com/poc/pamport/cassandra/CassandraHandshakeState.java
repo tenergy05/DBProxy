@@ -41,18 +41,14 @@ final class CassandraHandshakeState {
 
     // Enhanced tracking for robust client handling
     private String compression;           // Negotiated compression from STARTUP
-    private String expectedUsername;      // Expected username for validation (from config or session)
-    private String clientUsername;        // Username from client's AUTH_RESPONSE
     private String clientDriverName;      // Driver name from STARTUP
     private String clientDriverVersion;   // Driver version from STARTUP
-    private boolean usernameValidated;    // Whether username was validated
 
     CassandraHandshakeState(CassandraEngine.Config config) {
         this.config = Objects.requireNonNull(config, "config");
         this.gss = new CassandraGssAuthenticator(config);
         this.requestLogger = config.requestLogger;
         this.auditRecorder = config.auditRecorder;
-        this.expectedUsername = config.expectedUsername; // May be null if no validation required
     }
 
     void frontend(Channel channel) {
@@ -122,65 +118,6 @@ final class CassandraHandshakeState {
                 backendDecoder.updateCompression(compression);
             }
         }
-    }
-
-    // ---- Username validation (like Teleport) ----
-
-    /**
-     * Set the expected username for validation.
-     * Called from config or when session user is established.
-     */
-    void setExpectedUsername(String username) {
-        this.expectedUsername = username;
-    }
-
-    /**
-     * Called when client's AUTH_RESPONSE is parsed.
-     * Returns error message if validation fails, null if ok.
-     */
-    String validateClientAuth(Protocol.AuthResponseMessage authResponse) {
-        if (authResponse == null || !authResponse.hasCredentials()) {
-            // No credentials in auth response - might be GSS or other authenticator
-            // We allow this since proxy handles backend auth anyway
-            log.debug("Client AUTH_RESPONSE has no password credentials");
-            return null;
-        }
-
-        this.clientUsername = authResponse.username();
-
-        // If session has a database user set, use that for validation
-        if (session != null && session.getDatabaseUser() != null) {
-            expectedUsername = session.getDatabaseUser();
-        }
-
-        // Validate username if we have an expected value
-        if (expectedUsername != null && !expectedUsername.isEmpty()) {
-            if (!expectedUsername.equals(clientUsername)) {
-                String error = String.format(
-                    "cassandra user %q doesn't match expected username %q",
-                    clientUsername, expectedUsername);
-                log.warn("Username validation failed: {}", error);
-                return error;
-            }
-            log.debug("Username validated: {}", clientUsername);
-        }
-
-        usernameValidated = true;
-
-        // Update session with validated username
-        if (session != null && clientUsername != null) {
-            session.setDatabaseUser(clientUsername);
-        }
-
-        return null; // Validation passed
-    }
-
-    String getClientUsername() {
-        return clientUsername;
-    }
-
-    boolean isUsernameValidated() {
-        return usernameValidated;
     }
 
     // ---- Driver info from STARTUP ----
@@ -367,15 +304,30 @@ final class CassandraHandshakeState {
     void fail(Throwable error) {
         startSession(error);
         Channel fe = frontend;
+        boolean handlerInstalled = false;
         if (fe != null && fe.isActive()) {
             try {
                 fe.pipeline().addAfter("cassandraFrameDecoder", "failedHandshake",
                     new CassandraFailedHandshakeHandler(error == null ? null : error.getMessage()));
+                handlerInstalled = true;
+                // Ensure the socket does not linger forever if the client stops talking.
+                fe.eventLoop().schedule(() -> {
+                    if (fe.isActive()) {
+                        fe.close();
+                    }
+                }, 5, java.util.concurrent.TimeUnit.SECONDS);
             } catch (Exception e) {
                 log.warn("Failed to install failed-handshake handler", e);
             }
         }
-        closeBoth();
+        // We still close backend/pending; frontend stays open long enough for the error response.
+        if (backend != null) {
+            backend.close();
+        }
+        releasePending();
+        if (!handlerInstalled) {
+            closeBoth();
+        }
     }
 
     /**

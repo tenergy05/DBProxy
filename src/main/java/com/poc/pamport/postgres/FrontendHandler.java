@@ -31,6 +31,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private boolean sessionStarted;
 
     FrontendHandler(PostgresEngine.TargetResolver targetResolver, QueryLogger queryLogger, AuditRecorder auditRecorder, Session session) {
+        super(false); // Disable auto-release; we manage ByteBuf lifecycle manually
         this.targetResolver = targetResolver;
         this.queryLogger = queryLogger;
         this.auditRecorder = auditRecorder;

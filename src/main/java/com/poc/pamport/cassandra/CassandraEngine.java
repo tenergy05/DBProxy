@@ -21,7 +21,6 @@ import org.slf4j.LoggerFactory;
  *
  * Enhanced features:
  * - Compression support (lz4, snappy)
- * - Username validation from client AUTH_RESPONSE
  * - Proper version negotiation for different client versions
  * - Modern framing (v5+) support
  */
@@ -96,10 +95,6 @@ public class CassandraEngine implements AutoCloseable {
         String krb5CcName;
         String clientPrincipal;
 
-        // Username validation (like Teleport)
-        String expectedUsername;          // If set, client username must match
-        boolean validateUsername = false; // Enable username validation
-
         public Config listenHost(String listenHost) {
             this.listenHost = listenHost;
             return this;
@@ -147,24 +142,6 @@ public class CassandraEngine implements AutoCloseable {
 
         public Config clientPrincipal(String clientPrincipal) {
             this.clientPrincipal = clientPrincipal;
-            return this;
-        }
-
-        /**
-         * Set expected username for validation.
-         * If set, client's AUTH_RESPONSE username must match this value.
-         */
-        public Config expectedUsername(String expectedUsername) {
-            this.expectedUsername = expectedUsername;
-            this.validateUsername = (expectedUsername != null && !expectedUsername.isEmpty());
-            return this;
-        }
-
-        /**
-         * Enable or disable username validation.
-         */
-        public Config validateUsername(boolean validateUsername) {
-            this.validateUsername = validateUsername;
             return this;
         }
     }

@@ -51,12 +51,14 @@ public final class CassandraFrameDecoder extends ByteToMessageDecoder {
      * Called by handler after parsing STARTUP message.
      */
     public void updateCompression(String compression) {
-        if (compression == null || compression.isEmpty() || "none".equalsIgnoreCase(compression)) {
-            return;
+        // Compression passthrough is not supported yet; keep NoopCompressor to avoid
+        // mismatched flags and partial recompression. We still remember the choice to log.
+        if (compression != null && !compression.isEmpty() && !"none".equalsIgnoreCase(compression)) {
+            // If/when compression support is added, wire the compressor into frame/segment codec.
+            // For now stick with no-op to avoid corrupting frames.
+            this.frameCodec = FrameCodec.defaultServer(primitive, new NoopCompressor<>());
+            this.segmentCodec = new SegmentCodec<>(primitive, new NoopCompressor<>());
         }
-        Compressor<ByteBuf> compressor = createCompressor(compression);
-        this.frameCodec = FrameCodec.defaultServer(primitive, compressor);
-        this.segmentCodec = new SegmentCodec<>(primitive, compressor);
     }
 
     /**
@@ -255,11 +257,8 @@ public final class CassandraFrameDecoder extends ByteToMessageDecoder {
      * Create compressor for the given compression algorithm.
      */
     private Compressor<ByteBuf> createCompressor(String compression) {
-        return switch (compression.toLowerCase()) {
-            case "lz4" -> new Lz4Compressor();
-            case "snappy" -> new SnappyCompressor();
-            default -> new NoopCompressor<>();
-        };
+        // Compression is effectively disabled today; keep NoopCompressor to avoid corrupting frames.
+        return new NoopCompressor<>();
     }
 
     /**

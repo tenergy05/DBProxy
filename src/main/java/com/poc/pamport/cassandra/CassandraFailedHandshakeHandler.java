@@ -21,31 +21,34 @@ final class CassandraFailedHandshakeHandler extends SimpleChannelInboundHandler<
     private boolean complete;
 
     CassandraFailedHandshakeHandler(String errorMessage) {
+        super(false); // Disable auto-release; we manage ByteBuf lifecycle manually
         this.errorMessage = errorMessage == null ? "authentication failed" : errorMessage;
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-        if (complete) {
-            ReferenceCountUtil.release(msg);
-            return;
-        }
-        Protocol.Header header = Protocol.parseHeader(msg);
-        if (header == null) {
-            ReferenceCountUtil.release(msg);
-            return;
-        }
-        int version = header.version();
-        int streamId = header.streamId();
-        switch (header.opcode()) {
-            case Protocol.OPCODE_OPTIONS -> ctx.writeAndFlush(buildSupported(ctx, version, streamId));
-            case Protocol.OPCODE_STARTUP -> ctx.writeAndFlush(buildAuthenticate(ctx, version, streamId));
-            case Protocol.OPCODE_AUTH_RESPONSE -> {
-                ctx.writeAndFlush(buildError(ctx, version, streamId, errorMessage))
-                    .addListener(f -> ctx.close());
-                complete = true;
+        try {
+            if (complete) {
+                return;
             }
-            default -> ReferenceCountUtil.release(msg);
+            Protocol.Header header = Protocol.parseHeader(msg);
+            if (header == null) {
+                return;
+            }
+            int version = header.version();
+            int streamId = header.streamId();
+            switch (header.opcode()) {
+                case Protocol.OPCODE_OPTIONS -> ctx.writeAndFlush(buildSupported(ctx, version, streamId));
+                case Protocol.OPCODE_STARTUP -> ctx.writeAndFlush(buildAuthenticate(ctx, version, streamId));
+                case Protocol.OPCODE_AUTH_RESPONSE -> {
+                    ctx.writeAndFlush(buildError(ctx, version, streamId, errorMessage))
+                        .addListener(f -> ctx.close());
+                    complete = true;
+                }
+                default -> { /* ignore unknown opcodes */ }
+            }
+        } finally {
+            ReferenceCountUtil.release(msg);
         }
     }
 

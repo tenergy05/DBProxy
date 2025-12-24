@@ -57,6 +57,7 @@ final class CassandraBackendHandler extends SimpleChannelInboundHandler<ByteBuf>
 
             case Protocol.OPCODE_ERROR -> {
                 log.warn("Backend sent ERROR during handshake");
+                state.startSession(new IllegalStateException("Backend error"));
                 state.forwardToFrontend(msg);
                 ctx.close();
             }

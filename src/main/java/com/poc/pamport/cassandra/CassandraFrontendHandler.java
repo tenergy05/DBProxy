@@ -22,7 +22,6 @@ import org.slf4j.LoggerFactory;
  *
  * Enhanced to match Teleport's approach:
  * - Parses STARTUP to extract compression and driver info
- * - Validates username from AUTH_RESPONSE (like Teleport's validateUsername)
  * - Properly handles different client protocol versions
  * - Sends proper error responses on validation failure
  */
@@ -44,6 +43,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     private boolean backendConnectFailed;
 
     CassandraFrontendHandler(CassandraEngine.Config config) {
+        super(false); // Disable auto-release; we manage ByteBuf lifecycle manually
         this.config = config;
         this.requestLogger = config.requestLogger;
         this.state = new CassandraHandshakeState(config);
@@ -183,28 +183,6 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
         // Parse AUTH_RESPONSE to extract username/password
         Protocol.AuthResponseMessage authResponse = Protocol.parseAuthResponse(msg);
 
-        if (authResponse != null && authResponse.hasCredentials()) {
-            log.debug("Client AUTH_RESPONSE: username={}", authResponse.username());
-
-            // Validate username if configured (like Teleport's validateUsername)
-            if (config.validateUsername) {
-                String error = state.validateClientAuth(authResponse);
-                if (error != null) {
-                    log.warn("Username validation failed for client {}: {}",
-                        session.getClientAddress(), error);
-                    // Send authentication error to client
-                    state.sendAuthError(ctx, header, error);
-                    ReferenceCountUtil.release(msg);
-                    return;
-                }
-            } else {
-                // Even without validation, capture username for session/audit
-                if (session != null && authResponse.username() != null) {
-                    session.setDatabaseUser(authResponse.username());
-                }
-            }
-        }
-
         // Drop client's AUTH_RESPONSE - proxy handles backend auth with GSS
         // The backend handler (CassandraBackendHandler) will send proxy's GSS token
         ReferenceCountUtil.release(msg);
@@ -227,13 +205,18 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
         ctx.close();
     }
 
+    /**
+     * Forward message to backend, consuming the msg reference.
+     * Caller should not use msg after this call.
+     */
     private void forwardToBackend(ByteBuf msg) {
         Channel ch = backend;
         if (ch == null) {
-            pending.add(msg.retain());
+            // Backend not connected yet, buffer for later
+            pending.add(msg); // Takes ownership, no retain needed
             return;
         }
-        ch.writeAndFlush(msg.retain());
+        ch.writeAndFlush(msg); // Takes ownership, no retain needed
     }
 
     private void flushPending() {
