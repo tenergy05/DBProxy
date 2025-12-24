@@ -51,14 +51,12 @@ public final class CassandraFrameDecoder extends ByteToMessageDecoder {
      * Called by handler after parsing STARTUP message.
      */
     public void updateCompression(String compression) {
-        // Compression passthrough is not supported yet; keep NoopCompressor to avoid
-        // mismatched flags and partial recompression. We still remember the choice to log.
-        if (compression != null && !compression.isEmpty() && !"none".equalsIgnoreCase(compression)) {
-            // If/when compression support is added, wire the compressor into frame/segment codec.
-            // For now stick with no-op to avoid corrupting frames.
-            this.frameCodec = FrameCodec.defaultServer(primitive, new NoopCompressor<>());
-            this.segmentCodec = new SegmentCodec<>(primitive, new NoopCompressor<>());
+        if (compression == null || compression.isEmpty() || "none".equalsIgnoreCase(compression)) {
+            return;
         }
+        Compressor<ByteBuf> compressor = createCompressor(compression);
+        this.frameCodec = FrameCodec.defaultServer(primitive, compressor);
+        this.segmentCodec = new SegmentCodec<>(primitive, compressor);
     }
 
     /**
@@ -257,8 +255,11 @@ public final class CassandraFrameDecoder extends ByteToMessageDecoder {
      * Create compressor for the given compression algorithm.
      */
     private Compressor<ByteBuf> createCompressor(String compression) {
-        // Compression is effectively disabled today; keep NoopCompressor to avoid corrupting frames.
-        return new NoopCompressor<>();
+        return switch (compression.toLowerCase()) {
+            case "lz4" -> new Lz4Compressor();
+            case "snappy" -> new SnappyCompressor();
+            default -> new NoopCompressor<>();
+        };
     }
 
     /**
@@ -269,15 +270,27 @@ public final class CassandraFrameDecoder extends ByteToMessageDecoder {
 
         @Override
         public ByteBuf compress(ByteBuf uncompressed) {
-            // For proxy passthrough, we typically don't re-compress
-            // Just return a retained copy
-            return uncompressed.retainedDuplicate();
+            byte[] src = new byte[uncompressed.readableBytes()];
+            uncompressed.getBytes(uncompressed.readerIndex(), src);
+
+            net.jpountz.lz4.LZ4Compressor compressor = factory.fastCompressor();
+            int maxLen = compressor.maxCompressedLength(src.length);
+            byte[] dest = new byte[4 + maxLen];
+            int written = compressor.compress(src, 0, src.length, dest, 4, maxLen);
+            java.nio.ByteBuffer.wrap(dest).putInt(0, src.length);
+            return Unpooled.wrappedBuffer(dest, 0, 4 + written);
         }
 
         @Override
         public ByteBuf compressWithoutLength(ByteBuf uncompressed) {
-            // For proxy passthrough, we typically don't re-compress
-            return uncompressed.retainedDuplicate();
+            byte[] src = new byte[uncompressed.readableBytes()];
+            uncompressed.getBytes(uncompressed.readerIndex(), src);
+
+            net.jpountz.lz4.LZ4Compressor compressor = factory.fastCompressor();
+            int maxLen = compressor.maxCompressedLength(src.length);
+            byte[] dest = new byte[maxLen];
+            int written = compressor.compress(src, 0, src.length, dest, 0, maxLen);
+            return Unpooled.wrappedBuffer(dest, 0, written);
         }
 
         @Override
@@ -329,12 +342,19 @@ public final class CassandraFrameDecoder extends ByteToMessageDecoder {
     private static final class SnappyCompressor implements Compressor<ByteBuf> {
         @Override
         public ByteBuf compress(ByteBuf uncompressed) {
-            return uncompressed.retainedDuplicate();
+            try {
+                byte[] src = new byte[uncompressed.readableBytes()];
+                uncompressed.getBytes(uncompressed.readerIndex(), src);
+                byte[] compressedBytes = org.xerial.snappy.Snappy.compress(src);
+                return Unpooled.wrappedBuffer(compressedBytes);
+            } catch (Exception e) {
+                throw new IllegalStateException("Snappy compression failed", e);
+            }
         }
 
         @Override
         public ByteBuf compressWithoutLength(ByteBuf uncompressed) {
-            return uncompressed.retainedDuplicate();
+            return compress(uncompressed);
         }
 
         @Override
