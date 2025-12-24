@@ -161,6 +161,15 @@ final class CassandraHandshakeState {
 
     void fail(Throwable error) {
         startSession(error);
+        Channel fe = frontend;
+        if (fe != null && fe.isActive()) {
+            try {
+                fe.pipeline().addAfter("cassandraFrameDecoder", "failedHandshake",
+                    new CassandraFailedHandshakeHandler(error == null ? null : error.getMessage()));
+            } catch (Exception e) {
+                log.warn("Failed to install failed-handshake handler", e);
+            }
+        }
         closeBoth();
     }
 }
