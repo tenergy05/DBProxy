@@ -32,7 +32,10 @@ final class CassandraBackendHandler extends SimpleChannelInboundHandler<ByteBuf>
             case Protocol.OPCODE_SUPPORTED -> state.forwardToFrontend(msg);
             case Protocol.OPCODE_AUTHENTICATE -> handleAuthenticate(ctx, header, msg);
             case Protocol.OPCODE_AUTH_CHALLENGE -> handleAuthChallenge(ctx, header, msg);
-            case Protocol.OPCODE_AUTH_SUCCESS -> log.debug("Backend auth success");
+            case Protocol.OPCODE_AUTH_SUCCESS -> {
+                log.debug("Backend auth success");
+                state.forwardToFrontend(msg);
+            }
             case Protocol.OPCODE_READY -> handleReady(ctx, header, msg);
             case Protocol.OPCODE_ERROR -> {
                 state.forwardToFrontend(msg);
