@@ -43,6 +43,9 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     public void channelActive(ChannelHandlerContext ctx) {
         this.session = auditRecorder.newSession(ctx.channel().remoteAddress());
         this.session.setProtocol("cassandra");
+        this.session.setDatabaseType("cassandra");
+        this.session.setDatabaseProtocol("cassandra");
+        this.session.setDatabaseService(config.targetHost + ":" + config.targetPort);
         state.session(session);
         state.frontend(ctx.channel());
         BackendConnector connector = new BackendConnector(

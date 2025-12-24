@@ -15,10 +15,13 @@ public final class Session {
     private String clusterName;
     private String hostId;
     private String databaseService;
+    private String databaseType;
+    private String databaseProtocol;
     private String identityUser;
     private String autoCreateUserMode;
     private java.util.List<String> databaseRoles = java.util.Collections.emptyList();
     private java.util.Map<String, String> startupParameters = java.util.Collections.emptyMap();
+    private java.util.List<String> lockTargets = java.util.Collections.emptyList();
     private long postgresPid;
     private String userAgent;
     private String databaseUser;
@@ -107,6 +110,22 @@ public final class Session {
         this.databaseService = databaseService;
     }
 
+    public String getDatabaseType() {
+        return databaseType;
+    }
+
+    public void setDatabaseType(String databaseType) {
+        this.databaseType = databaseType;
+    }
+
+    public String getDatabaseProtocol() {
+        return databaseProtocol;
+    }
+
+    public void setDatabaseProtocol(String databaseProtocol) {
+        this.databaseProtocol = databaseProtocol;
+    }
+
     public String getIdentityUser() {
         return identityUser;
     }
@@ -137,6 +156,14 @@ public final class Session {
 
     public void setStartupParameters(java.util.Map<String, String> startupParameters) {
         this.startupParameters = startupParameters == null ? java.util.Collections.emptyMap() : startupParameters;
+    }
+
+    public java.util.List<String> getLockTargets() {
+        return lockTargets;
+    }
+
+    public void setLockTargets(java.util.List<String> lockTargets) {
+        this.lockTargets = lockTargets == null ? java.util.Collections.emptyList() : lockTargets;
     }
 
     public long getPostgresPid() {

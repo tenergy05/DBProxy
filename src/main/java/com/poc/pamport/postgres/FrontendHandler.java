@@ -60,6 +60,8 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
             session.setDatabaseUser(startup.parameters.get("user"));
             session.setDatabaseName(startup.parameters.get("database"));
             session.setApplicationName(startup.parameters.get("application_name"));
+            session.setUserAgent(startup.parameters.get("application_name"));
+            session.setStartupParameters(startup.parameters);
         } else if (parsed instanceof PgMessages.CancelRequest) {
             startupSeen = true;
         } else if (parsed instanceof PgMessages.PasswordMessage password) {
@@ -126,6 +128,9 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
                 .addListener(ChannelFutureListener.CLOSE);
             return;
         }
+        session.setDatabaseService(route.dbName() != null ? route.dbName() : route.host());
+        session.setDatabaseType("postgres");
+        session.setDatabaseProtocol("postgres");
         PgGssBackend.connect(ctx, route, session, auditRecorder, client -> {
             backend = client;
             MessagePump.link(ctx.channel(), backend);
