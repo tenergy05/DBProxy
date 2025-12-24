@@ -35,7 +35,7 @@ final class CassandraGssAuthenticator {
     private Subject subject;
     private GSSContext context;
 
-    CassandraGssAuthenticator(CassandraProxyServer.Config config) {
+    CassandraGssAuthenticator(CassandraEngine.Config config) {
         this.host = config.targetHost;
         this.servicePrincipal = config.servicePrincipal;
         this.krb5ConfPath = config.krb5ConfPath;

@@ -1,7 +1,7 @@
 package com.poc.pamport.dbproxy.cassandra;
 
-import com.poc.pamport.dbproxy.core.BackendConnector;
-import com.poc.pamport.dbproxy.core.BackendHandler;
+import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
+import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
@@ -12,24 +12,22 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import java.util.Objects;
-import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
-import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
 
 /**
- * CassandraProxyServer is a placeholder proxy for Cassandra native protocol.
+ * CassandraEngine mirrors Teleport's naming: a listener that terminates SASL/GSS on behalf of clients
+ * and forwards Cassandra native protocol thereafter.
  */
-public final class CassandraProxyServer implements AutoCloseable {
-    private static final Logger log = LoggerFactory.getLogger(CassandraProxyServer.class);
+public class CassandraEngine implements AutoCloseable {
+    private static final Logger log = LoggerFactory.getLogger(CassandraEngine.class);
 
-    private final Config config;
-    private EventLoopGroup bossGroup;
-    private EventLoopGroup workerGroup;
-    private Channel serverChannel;
+    protected final Config config;
+    protected EventLoopGroup bossGroup;
+    protected EventLoopGroup workerGroup;
+    protected Channel serverChannel;
 
-    public CassandraProxyServer(Config config) {
+    public CassandraEngine(Config config) {
         this.config = Objects.requireNonNull(config, "config");
     }
 
@@ -54,7 +52,7 @@ public final class CassandraProxyServer implements AutoCloseable {
 
         ChannelFuture bindFuture = bootstrap.bind(config.listenHost, config.listenPort).sync();
         serverChannel = bindFuture.channel();
-        log.info("Cassandra proxy listening on {}:{} -> {}:{}", config.listenHost, config.listenPort, config.targetHost, config.targetPort);
+        log.info("Cassandra engine listening on {}:{} -> {}:{}", config.listenHost, config.listenPort, config.targetHost, config.targetPort);
     }
 
     public void blockUntilShutdown() throws InterruptedException {
@@ -142,11 +140,11 @@ public final class CassandraProxyServer implements AutoCloseable {
 
     public static void main(String[] args) throws InterruptedException {
         Config config = new Config();
-        try (CassandraProxyServer server = new CassandraProxyServer(config)) {
+        try (CassandraEngine server = new CassandraEngine(config)) {
             server.start();
             server.blockUntilShutdown();
         } catch (Exception e) {
-            log.error("Cassandra proxy stopped with error", e);
+            log.error("Cassandra engine stopped with error", e);
         }
     }
 }

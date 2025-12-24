@@ -20,7 +20,7 @@ import org.slf4j.LoggerFactory;
 final class CassandraHandshakeState {
     private static final Logger log = LoggerFactory.getLogger(CassandraHandshakeState.class);
 
-    private final CassandraProxyServer.Config config;
+    private final CassandraEngine.Config config;
     private final CassandraGssAuthenticator gss;
     private final CassandraRequestLogger requestLogger;
     private final AuditRecorder auditRecorder;
@@ -33,7 +33,7 @@ final class CassandraHandshakeState {
     private DbSession session;
     private boolean sessionStarted;
 
-    CassandraHandshakeState(CassandraProxyServer.Config config) {
+    CassandraHandshakeState(CassandraEngine.Config config) {
         this.config = Objects.requireNonNull(config, "config");
         this.gss = new CassandraGssAuthenticator(config);
         this.requestLogger = config.requestLogger;

@@ -23,7 +23,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
 
     private static final Logger log = LoggerFactory.getLogger(CassandraFrontendHandler.class);
 
-    private final CassandraProxyServer.Config config;
+    private final CassandraEngine.Config config;
     private final CassandraRequestLogger requestLogger;
     private final List<ByteBuf> pending = new ArrayList<>();
     private final CassandraHandshakeState state;
@@ -31,7 +31,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     private DbSession session;
     private Channel backend;
 
-    CassandraFrontendHandler(CassandraProxyServer.Config config) {
+    CassandraFrontendHandler(CassandraEngine.Config config) {
         this.config = config;
         this.requestLogger = config.requestLogger;
         this.state = new CassandraHandshakeState(config);
