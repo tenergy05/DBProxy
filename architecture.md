@@ -1,7 +1,7 @@
 # DBProxy Architecture (Java/Netty Prototype)
 
 ## Goal
-Teleport-style (v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra), adds pluggable auth (JSON Web Token, JWT placeholder), routing, and audit hooks, while keeping clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) unchanged.
+Teleport-style (v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra) with Teleport-like naming/layout. Clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) remain unaware of auth; the proxy completes SASL/GSS (Kerberos) to the backend using its own credentials.
 
 Protocol selection is determined by the listener/engine or routing metadata, not by sniffing bytes.
 
@@ -10,12 +10,12 @@ Protocol selection is determined by the listener/engine or routing metadata, not
   - `BackendConnector`: dials backend using frontend event loop with a supplied pipeline initializer.
   - `BackendHandler`: streams backend → frontend.
   - `MessagePump`: ties lifecycles and flush-closes channels.
-  - `audit/*`: `AuditRecorder`, `DbSession`, `Query`, `Result`, `LoggingAuditRecorder`.
+  - `audit/*`: `AuditRecorder`, `Session`, `Query`, `Result`, `LoggingAuditRecorder`.
 - **postgres**: Postgres (PG)-specific framing, parsing, proxy server.
-  - `PostgresEngine`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port; optional listener TLS (Transport Layer Security) via Netty `SslHandler`.
+  - `PostgresEngine`: Netty server bootstrap; per-connection session metadata and routing to backend host/port; optional listener TLS via Netty `SslHandler`.
   - `PostgresFrameDecoder`: PG frame splitter (startup vs typed messages). Public so other packages can reuse in pipelines.
   - `PgMessages`: PG frontend parsing (Startup/Cancel/Query/Parse/Bind/Execute/Password/Terminate) and helpers (encode query, auth ok/cleartext, error response).
-  - `FrontendHandler`: parses client messages, validates JWT (PasswordMessage), resolves backend, forwards frames, emits audit.
+  - `FrontendHandler`: parses client messages, ignores client passwords (proxy owns backend auth), resolves backend, forwards frames, emits audit.
   - `PostgresBackendAuditHandler`: inspects backend CommandComplete/ErrorResponse → audit result. Public ctor for cross-package pipeline wiring.
   - `QueryLogger`/`LoggingQueryLogger`: query inspection/rewrite hooks.
   - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Generic Security Services API, Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
