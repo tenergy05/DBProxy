@@ -21,7 +21,7 @@ Protocol selection is determined by the listener/engine or routing metadata, not
   - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Generic Security Services API, Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
 - **mongo**: Length-prefixed framing, passthrough proxy with request logger.
   - `MongoEngine`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
-- **cassandra**: Cassandra-native framing (9-byte header) engine with proxy-terminated SASL/GSS (Kerberos) to the backend; client sees a ready session without supplying credentials. Request logger can parse queries for audit-style logs.
+- **cassandra**: Cassandra-native framing (v4/v5/v6; modern segments) engine with proxy-terminated SASL/GSS (Kerberos) to the backend; client sees a ready session without supplying credentials. Request logger can parse queries for audit-style logs.
   - `CassandraEngine` (listener), `CassandraFrontendHandler`, `CassandraBackendHandler`, `CassandraFrameDecoder`, `CassandraRequestLogger`/`LoggingCassandraRequestLogger`.
 
 ## Current Auth Model (JWT Placeholder)
@@ -143,10 +143,10 @@ Protocol selection is determined by the listener/engine or routing metadata, not
 - Missing features vs production: TLS to client/backend, scram/kerberos auth, structured command parsing/audit, compressions (snappy/zlib/zstd) awareness.
 
 ## Cassandra Path (Current)
-- Pipeline: `CassandraFrameDecoder` (native 9-byte header + body length) → `CassandraFrontendHandler` (started by `CassandraEngine`); backend pipeline mirrors framing + `CassandraBackendHandler`.
-- Proxy-terminated SASL/GSS (Kerberos): proxy answers backend `AUTHENTICATE`/`AUTH_CHALLENGE` with its own GSS tokens (from ticket cache), ignores client `AUTH_RESPONSE`, and forwards `AUTH_SUCCESS/READY` so clients stay unauthenticated. Kerberos config: `servicePrincipal`, `krb5ConfPath`, `krb5CcName`, `clientPrincipal`.
+- Pipeline: `CassandraFrameDecoder` (DataStax native-protocol, supports v4 and modern v5/v6 segment framing) → `CassandraFrontendHandler` (started by `CassandraEngine`); backend pipeline mirrors framing + `CassandraBackendHandler`.
+- Proxy-terminated SASL/GSS (Kerberos): proxy answers backend `AUTHENTICATE`/`AUTH_CHALLENGE` with its own GSS tokens (from ticket cache), ignores client `AUTH_RESPONSE`, and forwards `AUTH_SUCCESS/READY` so clients stay unauthenticated. Kerberos config: `servicePrincipal`, `krb5ConfPath`, `krb5CcName`, `clientPrincipal`. Protocol version is passed through; modern frames are segmented/reassembled. Compression is currently no-op (segments are expected uncompressed).
 - Audit: parsed Query/Prepare/Execute/Batch/Register are emitted to `AuditRecorder` (default `LoggingAuditRecorder`); `LoggingCassandraRequestLogger` still dumps headers/hex.
-- Missing: listener/backend TLS, modern framing/compression parsing, richer session metadata (db user/name) in audit.
+- Missing vs Teleport: listener/backend TLS, basic username validation/failedHandshake, AWS SigV4 auth path, and compressed segments (payload compression) handling.
 
 ## Extension Points / TODO
 - Implement real JWT validation (signature, exp, audience) and map claims to routing + session metadata.
