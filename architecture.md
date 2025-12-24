@@ -12,7 +12,7 @@ Protocol selection is determined by the listener/engine or routing metadata, not
   - `MessagePump`: ties lifecycles and flush-closes channels.
   - `audit/*`: `AuditRecorder`, `DbSession`, `Query`, `Result`, `LoggingAuditRecorder`.
 - **postgres**: Postgres (PG)-specific framing, parsing, proxy server.
-  - `PostgresProxyServer`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port; optional listener TLS (Transport Layer Security) via Netty `SslHandler`.
+  - `PostgresEngine`: Netty server bootstrap; per-connection session, JWT validation, routing to backend host/port; optional listener TLS (Transport Layer Security) via Netty `SslHandler`.
   - `PostgresFrameDecoder`: PG frame splitter (startup vs typed messages). Public so other packages can reuse in pipelines.
   - `PgMessages`: PG frontend parsing (Startup/Cancel/Query/Parse/Bind/Execute/Password/Terminate) and helpers (encode query, auth ok/cleartext, error response).
   - `FrontendHandler`: parses client messages, validates JWT (PasswordMessage), resolves backend, forwards frames, emits audit.
@@ -20,7 +20,7 @@ Protocol selection is determined by the listener/engine or routing metadata, not
   - `QueryLogger`/`LoggingQueryLogger`: query inspection/rewrite hooks.
   - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Generic Security Services API, Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
 - **mongo**: Length-prefixed framing, passthrough proxy with request logger.
-  - `MongoProxyServer`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
+  - `MongoEngine`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
 - **cassandra**: Cassandra-native framing (9-byte header) engine with proxy-terminated SASL/GSS (Kerberos) to the backend; client sees a ready session without supplying credentials. Request logger can parse queries for audit-style logs.
   - `CassandraEngine` (listener), `CassandraFrontendHandler`, `CassandraBackendHandler`, `CassandraFrameDecoder`, `CassandraRequestLogger`/`LoggingCassandraRequestLogger`.
 
@@ -37,7 +37,7 @@ Protocol selection is determined by the listener/engine or routing metadata, not
 - Direct clients (psql/JDBC/IntelliJ) must paste JWT as the password unless a local agent injects it.
 
 ## Routing Model
-- `PostgresProxyServer.Config` exposes `TargetResolver` to choose backend target (host/port + auth material) per connection, based on `DbSession` (user/db/app) and JWT string.
+- `PostgresEngine.Config` exposes `TargetResolver` to choose backend target (host/port + auth material) per connection, based on `DbSession` (user/db/app) and JWT string.
 - Convenience `addRoute(databaseName, Route)` with `*` default. Example (JSON is easiest; see `src/main/resources/config.sample.json`):
   ```json
   {
@@ -66,7 +66,7 @@ Protocol selection is determined by the listener/engine or routing metadata, not
 
 ## Local Config (JSON)
 - Default main loads `config.sample.json` from classpath; override by passing a path arg if needed.
-- Load programmatically with `PostgresProxyServer.Config.fromJson(path)` or `fromClasspath("config.sample.json")`.
+- Load programmatically with `PostgresEngine.Config.fromJson(path)` or `fromClasspath("config.sample.json")`.
 - Shape:
   ```json
   (see `src/main/resources/config.sample.json` for a complete example with TLS/Kerberos fields and 3 routes)
@@ -97,10 +97,10 @@ Protocol selection is determined by the listener/engine or routing metadata, not
   - Override config file: `java -jar target/dbproxy-0.1.0-SNAPSHOT.jar /path/to/config.json`
   - Programmatic (for embedding):
     ```java
-    var cfg = new PostgresProxyServer.Config()
-        .addRoute("*", new PostgresProxyServer.Route("127.0.0.1", 5432, "postgres", null, null, null, null, null, null, null))
+    var cfg = new PostgresEngine.Config()
+        .addRoute("*", new PostgresEngine.Route("127.0.0.1", 5432, "postgres", null, null, null, null, null, null, null))
         .jwtValidator(token -> true); // TODO real JWT check
-    new PostgresProxyServer(cfg).start();
+    new PostgresEngine(cfg).start();
     ```
   Connect with psql/JDBC/IntelliJ to proxy host/port, DB/user as normal; put JWT in password field.
 
