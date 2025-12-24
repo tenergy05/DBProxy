@@ -17,6 +17,11 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Tracks a single Cassandra frontend/backend pair during handshake.
+ *
+ * Enhanced to match Teleport's approach:
+ * - Tracks compression negotiated in STARTUP
+ * - Validates username from client's AUTH_RESPONSE
+ * - Supports separate frontend/backend frame decoders for version mismatch
  */
 final class CassandraHandshakeState {
     private static final Logger log = LoggerFactory.getLogger(CassandraHandshakeState.class);
@@ -34,11 +39,20 @@ final class CassandraHandshakeState {
     private Session session;
     private boolean sessionStarted;
 
+    // Enhanced tracking for robust client handling
+    private String compression;           // Negotiated compression from STARTUP
+    private String expectedUsername;      // Expected username for validation (from config or session)
+    private String clientUsername;        // Username from client's AUTH_RESPONSE
+    private String clientDriverName;      // Driver name from STARTUP
+    private String clientDriverVersion;   // Driver version from STARTUP
+    private boolean usernameValidated;    // Whether username was validated
+
     CassandraHandshakeState(CassandraEngine.Config config) {
         this.config = Objects.requireNonNull(config, "config");
         this.gss = new CassandraGssAuthenticator(config);
         this.requestLogger = config.requestLogger;
         this.auditRecorder = config.auditRecorder;
+        this.expectedUsername = config.expectedUsername; // May be null if no validation required
     }
 
     void frontend(Channel channel) {
@@ -51,6 +65,10 @@ final class CassandraHandshakeState {
 
     void backend(Channel channel) {
         this.backend = channel;
+    }
+
+    Channel backend() {
+        return backend;
     }
 
     CassandraGssAuthenticator gss() {
@@ -76,6 +94,151 @@ final class CassandraHandshakeState {
         return protocolVersion == -1 ? 4 : protocolVersion;
     }
 
+    // ---- Compression handling ----
+
+    /**
+     * Called when STARTUP is parsed to capture compression setting.
+     */
+    void setCompression(String compression) {
+        this.compression = compression;
+        // Update frontend decoder
+        CassandraFrameDecoder frontendDecoder = getFrontendDecoder();
+        if (frontendDecoder != null && compression != null) {
+            frontendDecoder.updateCompression(compression);
+        }
+    }
+
+    String getCompression() {
+        return compression;
+    }
+
+    /**
+     * Update backend decoder compression after we've seen STARTUP.
+     */
+    void updateBackendCompression() {
+        if (compression != null && backend != null) {
+            CassandraFrameDecoder backendDecoder = getBackendDecoder();
+            if (backendDecoder != null) {
+                backendDecoder.updateCompression(compression);
+            }
+        }
+    }
+
+    // ---- Username validation (like Teleport) ----
+
+    /**
+     * Set the expected username for validation.
+     * Called from config or when session user is established.
+     */
+    void setExpectedUsername(String username) {
+        this.expectedUsername = username;
+    }
+
+    /**
+     * Called when client's AUTH_RESPONSE is parsed.
+     * Returns error message if validation fails, null if ok.
+     */
+    String validateClientAuth(Protocol.AuthResponseMessage authResponse) {
+        if (authResponse == null || !authResponse.hasCredentials()) {
+            // No credentials in auth response - might be GSS or other authenticator
+            // We allow this since proxy handles backend auth anyway
+            log.debug("Client AUTH_RESPONSE has no password credentials");
+            return null;
+        }
+
+        this.clientUsername = authResponse.username();
+
+        // If session has a database user set, use that for validation
+        if (session != null && session.getDatabaseUser() != null) {
+            expectedUsername = session.getDatabaseUser();
+        }
+
+        // Validate username if we have an expected value
+        if (expectedUsername != null && !expectedUsername.isEmpty()) {
+            if (!expectedUsername.equals(clientUsername)) {
+                String error = String.format(
+                    "cassandra user %q doesn't match expected username %q",
+                    clientUsername, expectedUsername);
+                log.warn("Username validation failed: {}", error);
+                return error;
+            }
+            log.debug("Username validated: {}", clientUsername);
+        }
+
+        usernameValidated = true;
+
+        // Update session with validated username
+        if (session != null && clientUsername != null) {
+            session.setDatabaseUser(clientUsername);
+        }
+
+        return null; // Validation passed
+    }
+
+    String getClientUsername() {
+        return clientUsername;
+    }
+
+    boolean isUsernameValidated() {
+        return usernameValidated;
+    }
+
+    // ---- Driver info from STARTUP ----
+
+    void setDriverInfo(String name, String version) {
+        this.clientDriverName = name;
+        this.clientDriverVersion = version;
+        if (session != null) {
+            String userAgent = (name != null ? name : "unknown") +
+                (version != null ? "/" + version : "");
+            session.setUserAgent(userAgent);
+        }
+    }
+
+    String getClientDriverName() {
+        return clientDriverName;
+    }
+
+    String getClientDriverVersion() {
+        return clientDriverVersion;
+    }
+
+    // ---- Framing mode switching (like Teleport) ----
+
+    /**
+     * Switch frontend decoder to modern framing after READY/AUTHENTICATE.
+     */
+    void switchFrontendToModernFraming(int version) {
+        CassandraFrameDecoder decoder = getFrontendDecoder();
+        if (decoder != null) {
+            decoder.switchToModernFramingRead(version);
+            decoder.switchToModernFramingWrite(version);
+        }
+    }
+
+    /**
+     * Switch backend decoder to modern framing after READY/AUTHENTICATE.
+     */
+    void switchBackendToModernFraming(int version) {
+        CassandraFrameDecoder decoder = getBackendDecoder();
+        if (decoder != null) {
+            decoder.switchToModernFramingRead(version);
+            decoder.switchToModernFramingWrite(version);
+        }
+    }
+
+    private CassandraFrameDecoder getFrontendDecoder() {
+        if (frontend == null) return null;
+        return (CassandraFrameDecoder) frontend.pipeline().get("cassandraFrameDecoder");
+    }
+
+    private CassandraFrameDecoder getBackendDecoder() {
+        if (backend == null) return null;
+        return (CassandraFrameDecoder) backend.pipeline().get("cassandraFrameDecoder");
+    }
+
+    // ---- Pending message handling ----
+
     void addPending(ByteBuf buf) {
         pending.add(buf.retain());
     }
@@ -92,6 +255,15 @@ final class CassandraHandshakeState {
         ch.flush();
     }
 
+    void releasePending() {
+        for (ByteBuf buf : pending) {
+            ReferenceCountUtil.safeRelease(buf);
+        }
+        pending.clear();
+    }
+
+    // ---- Message forwarding ----
+
     void forwardToFrontend(ByteBuf msg) {
         Channel ch = frontend;
         if (ch != null && ch.isActive()) {
@@ -101,6 +273,18 @@ final class CassandraHandshakeState {
         }
     }
 
+    void forwardToBackend(ByteBuf msg) {
+        Channel ch = backend;
+        if (ch != null && ch.isActive()) {
+            ch.writeAndFlush(msg.retain());
+        } else {
+            // Backend not ready yet, buffer the message
+            addPending(msg);
+        }
+    }
+
+    // ---- Connection management ----
+
     void closeBoth() {
         if (closed.compareAndSet(false, true)) {
             if (frontend != null) {
@@ -109,13 +293,12 @@ final class CassandraHandshakeState {
             if (backend != null) {
                 backend.close();
             }
-            for (ByteBuf buf : pending) {
-                ReferenceCountUtil.safeRelease(buf);
-            }
-            pending.clear();
+            releasePending();
             endSession();
         }
     }
+
+    // ---- Auth response sending ----
 
     void sendAuthResponse(ChannelHandlerContext ctx, Protocol.Header header, byte[] token) {
         ByteBuf buf = ctx.alloc().buffer(Protocol.HEADER_LENGTH + Integer.BYTES + token.length);
@@ -129,6 +312,26 @@ final class CassandraHandshakeState {
         buf.writeBytes(token);
         ctx.writeAndFlush(buf);
     }
+
+    /**
+     * Send authentication error to client.
+     */
+    void sendAuthError(ChannelHandlerContext ctx, Protocol.Header header, String message) {
+        byte[] msgBytes = message.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        int bodyLen = Integer.BYTES + Short.BYTES + msgBytes.length;
+        ByteBuf buf = ctx.alloc().buffer(Protocol.HEADER_LENGTH + bodyLen);
+        buf.writeByte((byte) (0x80 | protocolVersion())); // response direction
+        buf.writeByte(0); // flags
+        buf.writeShort(header.streamId());
+        buf.writeByte(Protocol.OPCODE_ERROR);
+        buf.writeInt(bodyLen);
+        buf.writeInt(0x0100); // AUTH_ERROR code
+        buf.writeShort(msgBytes.length);
+        buf.writeBytes(msgBytes);
+        ctx.writeAndFlush(buf).addListener(f -> ctx.close());
+    }
+
+    // ---- Session management ----
 
     void session(Session session) {
         this.session = session;
@@ -159,6 +362,8 @@ final class CassandraHandshakeState {
         auditRecorder.onQuery(session, Query.of(parsed.detail()));
     }
 
+    // ---- Error handling ----
+
     void fail(Throwable error) {
         startSession(error);
         Channel fe = frontend;
@@ -170,6 +375,14 @@ final class CassandraHandshakeState {
                 log.warn("Failed to install failed-handshake handler", e);
             }
         }
+        closeBoth();
+    }
+
+    /**
+     * Fail with a specific error sent to the client before closing.
+     */
+    void failWithError(String errorMessage) {
+        startSession(new IllegalStateException(errorMessage));
         closeBoth();
     }
 }

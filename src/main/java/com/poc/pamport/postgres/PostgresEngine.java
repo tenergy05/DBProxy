@@ -20,7 +20,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -61,8 +60,7 @@ public final class PostgresEngine implements AutoCloseable {
                         ch.pipeline().addLast("ssl", config.tlsContext.newHandler(ch.alloc()));
                     }
                     ch.pipeline().addLast("pgFrameDecoder", new PostgresFrameDecoder(true));
-                    Predicate<String> jwtValidator = config.jwtValidator;
-                    ch.pipeline().addLast("frontendHandler", new FrontendHandler(config.targetResolver, config.queryLogger, config.auditRecorder, session, jwtValidator));
+                    ch.pipeline().addLast("frontendHandler", new FrontendHandler(config.targetResolver, config.queryLogger, config.auditRecorder, session));
                 }
             });
 
@@ -98,7 +96,7 @@ public final class PostgresEngine implements AutoCloseable {
         String listenHost = "0.0.0.0";
         int listenPort = 15432;
         Map<String, Route> staticRoutes = new HashMap<>();
-        TargetResolver targetResolver = (session, jwt) -> {
+        TargetResolver targetResolver = session -> {
             if (session.getDatabaseName() != null && staticRoutes.containsKey(session.getDatabaseName())) {
                 return staticRoutes.get(session.getDatabaseName());
             }
@@ -109,7 +107,6 @@ public final class PostgresEngine implements AutoCloseable {
         };
         QueryLogger queryLogger = new LoggingQueryLogger();
         AuditRecorder auditRecorder = new LoggingAuditRecorder();
-        Predicate<String> jwtValidator = token -> true; // replace with real JWT validation
 
         public Config listenHost(String listenHost) {
             this.listenHost = listenHost;
@@ -141,11 +138,6 @@ public final class PostgresEngine implements AutoCloseable {
 
         public Config auditRecorder(AuditRecorder auditRecorder) {
             this.auditRecorder = Objects.requireNonNull(auditRecorder);
-            return this;
-        }
-
-        public Config jwtValidator(Predicate<String> jwtValidator) {
-            this.jwtValidator = Objects.requireNonNull(jwtValidator);
             return this;
         }
 
@@ -258,7 +250,7 @@ public final class PostgresEngine implements AutoCloseable {
      */
     @FunctionalInterface
     public interface TargetResolver {
-        Route resolve(Session session, String jwt);
+        Route resolve(Session session);
     }
 
     /**

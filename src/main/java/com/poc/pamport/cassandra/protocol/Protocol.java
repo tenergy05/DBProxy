@@ -3,11 +3,14 @@ package com.poc.pamport.cassandra.protocol;
 import io.netty.buffer.ByteBuf;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Protocol constants and helpers mirroring Teleport's cassandra/protocol helpers.
+ * Extended to parse STARTUP and AUTH_RESPONSE for robust client handling.
  */
 public final class Protocol {
     public static final int HEADER_LENGTH = 9;
@@ -75,6 +78,129 @@ public final class Protocol {
         return out;
     }
 
+    /**
+     * Parse STARTUP message to extract options (CQL_VERSION, COMPRESSION, DRIVER_NAME, etc).
+     * Returns null if not a valid STARTUP message.
+     */
+    public static StartupMessage parseStartup(ByteBuf frame) {
+        Header header = parseHeader(frame);
+        if (header == null || header.opcode() != OPCODE_STARTUP) {
+            return null;
+        }
+        if (header.bodyLength() < Short.BYTES) {
+            return new StartupMessage(Map.of());
+        }
+        ByteBuf body = frame.slice(frame.readerIndex() + HEADER_LENGTH, header.bodyLength());
+        Map<String, String> options = readStringMap(body);
+        return new StartupMessage(options);
+    }
+
+    /**
+     * Parse AUTH_RESPONSE to extract credentials.
+     * Cassandra PasswordAuthenticator format: \0username\0password (NUL-delimited).
+     */
+    public static AuthResponseMessage parseAuthResponse(ByteBuf frame) {
+        Header header = parseHeader(frame);
+        if (header == null || header.opcode() != OPCODE_AUTH_RESPONSE) {
+            return null;
+        }
+        byte[] token = readAuthToken(frame, header.bodyLength());
+        if (token.length == 0) {
+            return new AuthResponseMessage(null, null, token);
+        }
+        // Parse PasswordAuthenticator format: \0username\0password
+        return parsePasswordAuthToken(token);
+    }
+
+    /**
+     * Parse PasswordAuthenticator token format: \0username\0password
+     */
+    private static AuthResponseMessage parsePasswordAuthToken(byte[] token) {
+        if (token.length < 3) {
+            return new AuthResponseMessage(null, null, token);
+        }
+        // Token format: [0x00][username bytes][0x00][password bytes]
+        // Find first NUL
+        int firstNul = -1;
+        for (int i = 0; i < token.length; i++) {
+            if (token[i] == 0) {
+                firstNul = i;
+                break;
+            }
+        }
+        if (firstNul < 0) {
+            // No NUL found - might be a different authenticator format
+            return new AuthResponseMessage(null, null, token);
+        }
+
+        // Find second NUL (after username)
+        int secondNul = -1;
+        for (int i = firstNul + 1; i < token.length; i++) {
+            if (token[i] == 0) {
+                secondNul = i;
+                break;
+            }
+        }
+
+        String username;
+        String password;
+        if (secondNul < 0) {
+            // Only one NUL - might be: [0x00][username][0x00][password] with password going to end
+            // or: [username][0x00][password]
+            if (firstNul == 0) {
+                // Format: [0x00][rest] - username is between first NUL and end or second NUL
+                // Actually the standard format is: \0username\0password
+                // So we look for the pattern differently
+                int usernameEnd = -1;
+                for (int i = 1; i < token.length; i++) {
+                    if (token[i] == 0) {
+                        usernameEnd = i;
+                        break;
+                    }
+                }
+                if (usernameEnd > 1) {
+                    username = new String(token, 1, usernameEnd - 1, StandardCharsets.UTF_8);
+                    if (usernameEnd + 1 < token.length) {
+                        password = new String(token, usernameEnd + 1, token.length - usernameEnd - 1, StandardCharsets.UTF_8);
+                    } else {
+                        password = "";
+                    }
+                    return new AuthResponseMessage(username, password, token);
+                }
+            }
+            // Fallback: treat everything after first NUL as username, no password
+            username = new String(token, firstNul + 1, token.length - firstNul - 1, StandardCharsets.UTF_8);
+            password = null;
+        } else {
+            // Two NULs found
+            if (firstNul == 0) {
+                // Format: [0x00][username][0x00][password]
+                username = new String(token, 1, secondNul - 1, StandardCharsets.UTF_8);
+                password = new String(token, secondNul + 1, token.length - secondNul - 1, StandardCharsets.UTF_8);
+            } else {
+                // Format: [authzid][0x00][username][0x00][password] (SASL style)
+                username = new String(token, firstNul + 1, secondNul - firstNul - 1, StandardCharsets.UTF_8);
+                password = new String(token, secondNul + 1, token.length - secondNul - 1, StandardCharsets.UTF_8);
+            }
+        }
+        return new AuthResponseMessage(username, password, token);
+    }
+
+    /**
+     * Parse AUTHENTICATE message to extract authenticator class name.
+     */
+    public static String parseAuthenticateClass(ByteBuf frame) {
+        Header header = parseHeader(frame);
+        if (header == null || header.opcode() != OPCODE_AUTHENTICATE) {
+            return null;
+        }
+        if (header.bodyLength() < Short.BYTES) {
+            return "";
+        }
+        ByteBuf body = frame.slice(frame.readerIndex() + HEADER_LENGTH, header.bodyLength());
+        return readString(body);
+    }
+
     public static ParsedMessage parseForAudit(ByteBuf frame) {
         Header header = parseHeader(frame);
         if (header == null) {
@@ -107,6 +233,22 @@ public final class Protocol {
             }
         }
         return "type=" + type + " statements=" + String.join(" | ", stmts);
+    }
+
+    private static Map<String, String> readStringMap(ByteBuf body) {
+        Map<String, String> map = new HashMap<>();
+        if (body.readableBytes() < Short.BYTES) {
+            return map;
+        }
+        int count = body.readUnsignedShort();
+        for (int i = 0; i < count && body.readableBytes() >= Short.BYTES; i++) {
+            String key = readString(body);
+            String value = readString(body);
+            if (key != null && value != null) {
+                map.put(key, value);
+            }
+        }
+        return map;
     }
 
     private static String readLongString(ByteBuf body) {
@@ -173,9 +315,41 @@ public final class Protocol {
         return HEX.formatHex(data);
     }
 
+    // ---- Record types ----
+
     public record Header(int version, boolean response, int flags, int streamId, int opcode, int bodyLength) {}
 
     public record ParsedMessage(String kind, String detail) {}
 
     public record Packet(Header header) {}
+
+    /**
+     * Parsed STARTUP message with options.
+     */
+    public record StartupMessage(Map<String, String> options) {
+        public String cqlVersion() {
+            return options.getOrDefault("CQL_VERSION", "3.0.0");
+        }
+
+        public String compression() {
+            return options.get("COMPRESSION");
+        }
+
+        public String driverName() {
+            return options.get("DRIVER_NAME");
+        }
+
+        public String driverVersion() {
+            return options.get("DRIVER_VERSION");
+        }
+    }
+
+    /**
+     * Parsed AUTH_RESPONSE message with credentials.
+     */
+    public record AuthResponseMessage(String username, String password, byte[] rawToken) {
+        public boolean hasCredentials() {
+            return username != null && !username.isEmpty();
+        }
+    }
 }

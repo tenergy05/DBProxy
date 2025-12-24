@@ -1,6 +1,5 @@
 package com.poc.pamport.postgres;
 
-import com.poc.pamport.core.BackendHandler;
 import com.poc.pamport.core.MessagePump;
 import com.poc.pamport.core.audit.AuditRecorder;
 import com.poc.pamport.core.audit.Session;
@@ -8,11 +7,9 @@ import com.poc.pamport.core.audit.Query;
 import com.poc.pamport.postgres.auth.PgGssBackend;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
-import io.netty.channel.socket.SocketChannel;
 import io.netty.util.ReferenceCountUtil;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Predicate;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,20 +24,18 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private final QueryLogger queryLogger;
     private final AuditRecorder auditRecorder;
     private final Session session;
-    private final Predicate<String> jwtValidator;
     private final PostgresEngine.TargetResolver targetResolver;
     private final List<ByteBuf> pending = new ArrayList<>();
     private Channel backend;
     private boolean startupSeen;
-    private String jwt;
+    private boolean sessionStarted;
 
-    FrontendHandler(PostgresEngine.TargetResolver targetResolver, QueryLogger queryLogger, AuditRecorder auditRecorder, Session session, Predicate<String> jwtValidator) {
+    FrontendHandler(PostgresEngine.TargetResolver targetResolver, QueryLogger queryLogger, AuditRecorder auditRecorder, Session session) {
         this.targetResolver = targetResolver;
         this.queryLogger = queryLogger;
         this.auditRecorder = auditRecorder;
         this.session = session;
         this.session.setProtocol("postgres");
-        this.jwtValidator = jwtValidator;
     }
 
     @Override
@@ -65,14 +60,10 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         } else if (parsed instanceof PgMessages.CancelRequest) {
             startupSeen = true;
         } else if (parsed instanceof PgMessages.PasswordMessage password) {
-            jwt = password.password;
-            if (!jwtValidator.test(jwt)) {
-                ctx.writeAndFlush(PgMessages.errorResponse(ctx.alloc(), "Invalid credentials"));
-                ctx.close();
-                return;
-            }
-            auditRecorder.onSessionStart(session, null);
-            shouldForward = false; // consume PasswordMessage (JWT) locally; never send to backend.
+            // Client password is ignored; proxy owns backend auth.
+            shouldForward = false;
+            ReferenceCountUtil.release(msg);
+            return;
         } else if (parsed instanceof PgMessages.Query query) {
             String rewritten = queryLogger.onQuery(query.sql);
             if (!rewritten.equals(query.sql)) {
@@ -122,7 +113,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         if (backend != null) {
             return;
         }
-        PostgresEngine.Route route = targetResolver.resolve(session, jwt);
+        PostgresEngine.Route route = targetResolver.resolve(session);
         if (route == null) {
             ctx.writeAndFlush(PgMessages.errorResponse(ctx.alloc(), "No route for database"))
                 .addListener(ChannelFutureListener.CLOSE);
@@ -134,10 +125,17 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
         PgGssBackend.connect(ctx, route, session, auditRecorder, client -> {
             backend = client;
             MessagePump.link(ctx.channel(), backend);
+            if (!sessionStarted) {
+                sessionStarted = true;
+                auditRecorder.onSessionStart(session, null);
+            }
             flushPending();
         }, error -> {
             log.warn("Failed to connect/authenticate to backend", error);
-            auditRecorder.onSessionStart(session, error);
+            if (!sessionStarted) {
+                sessionStarted = true;
+                auditRecorder.onSessionStart(session, error);
+            }
             ctx.writeAndFlush(PgMessages.errorResponse(ctx.alloc(), "Backend connection failed"))
                 .addListener(ChannelFutureListener.CLOSE);
         });

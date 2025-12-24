@@ -18,6 +18,12 @@ import org.slf4j.LoggerFactory;
 /**
  * CassandraEngine mirrors Teleport's naming: a listener that terminates SASL/GSS on behalf of clients
  * and forwards Cassandra native protocol thereafter.
+ *
+ * Enhanced features:
+ * - Compression support (lz4, snappy)
+ * - Username validation from client AUTH_RESPONSE
+ * - Proper version negotiation for different client versions
+ * - Modern framing (v5+) support
  */
 public class CassandraEngine implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(CassandraEngine.class);
@@ -52,7 +58,8 @@ public class CassandraEngine implements AutoCloseable {
 
         ChannelFuture bindFuture = bootstrap.bind(config.listenHost, config.listenPort).sync();
         serverChannel = bindFuture.channel();
-        log.info("Cassandra engine listening on {}:{} -> {}:{}", config.listenHost, config.listenPort, config.targetHost, config.targetPort);
+        log.info("Cassandra engine listening on {}:{} -> {}:{}",
+            config.listenHost, config.listenPort, config.targetHost, config.targetPort);
     }
 
     public void blockUntilShutdown() throws InterruptedException {
@@ -82,10 +89,16 @@ public class CassandraEngine implements AutoCloseable {
         int targetPort = 9042;
         CassandraRequestLogger requestLogger = new LoggingCassandraRequestLogger();
         AuditRecorder auditRecorder = new LoggingAuditRecorder();
+
+        // Kerberos/GSS configuration
         String servicePrincipal;
         String krb5ConfPath;
         String krb5CcName;
         String clientPrincipal;
+
+        // Username validation (like Teleport)
+        String expectedUsername;          // If set, client username must match
+        boolean validateUsername = false; // Enable username validation
 
         public Config listenHost(String listenHost) {
             this.listenHost = listenHost;
@@ -134,6 +147,24 @@ public class CassandraEngine implements AutoCloseable {
 
         public Config clientPrincipal(String clientPrincipal) {
             this.clientPrincipal = clientPrincipal;
+            return this;
+        }
+
+        /**
+         * Set expected username for validation.
+         * If set, client's AUTH_RESPONSE username must match this value.
+         */
+        public Config expectedUsername(String expectedUsername) {
+            this.expectedUsername = expectedUsername;
+            this.validateUsername = (expectedUsername != null && !expectedUsername.isEmpty());
+            return this;
+        }
+
+        /**
+         * Enable or disable username validation.
+         */
+        public Config validateUsername(boolean validateUsername) {
+            this.validateUsername = validateUsername;
             return this;
         }
     }
