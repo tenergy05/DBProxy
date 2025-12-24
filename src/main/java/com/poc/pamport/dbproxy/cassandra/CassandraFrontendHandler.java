@@ -14,24 +14,33 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * CassandraFrontendHandler forwards Cassandra native protocol messages and invokes optional logging hook.
+ * CassandraFrontendHandler parses client frames, drives backend SASL/GSS auth with proxy-owned creds,
+ * then switches to raw forwarding with audit/logging.
  */
 final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private static final Logger log = LoggerFactory.getLogger(CassandraFrontendHandler.class);
 
-    private final BackendConnector connector;
+    private final CassandraProxyServer.Config config;
     private final CassandraRequestLogger requestLogger;
     private final List<ByteBuf> pending = new ArrayList<>();
+    private final CassandraHandshakeState state;
     private Channel backend;
 
-    CassandraFrontendHandler(BackendConnector connector, CassandraRequestLogger requestLogger) {
-        this.connector = connector;
-        this.requestLogger = requestLogger;
+    CassandraFrontendHandler(CassandraProxyServer.Config config) {
+        this.config = config;
+        this.requestLogger = config.requestLogger;
+        this.state = new CassandraHandshakeState(config);
     }
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) {
+        state.frontend(ctx.channel());
+        BackendConnector connector = new BackendConnector(
+            config.targetHost,
+            config.targetPort,
+            frontend -> new CassandraBackendPipelineInitializer(state)
+        );
         connector.connect(ctx.channel())
             .addListener((ChannelFutureListener) future -> {
                 if (!future.isSuccess()) {
@@ -40,6 +49,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
                     return;
                 }
                 backend = future.channel();
+                state.backend(backend);
                 MessagePump.link(ctx.channel(), backend);
                 flushPending();
             });
@@ -47,15 +57,29 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-        byte[] copy = new byte[msg.readableBytes()];
-        msg.getBytes(msg.readerIndex(), copy);
-        requestLogger.onMessage(copy);
-
-        if (backend == null) {
-            pending.add(msg.retain());
+        CassandraMessages.FrameHeader header = CassandraMessages.parseHeader(msg);
+        if (header == null) {
+            ReferenceCountUtil.release(msg);
+            fail(ctx, new IllegalStateException("invalid Cassandra frame"));
             return;
         }
-        backend.writeAndFlush(msg.retain());
+        state.ensureProtocolVersion(header.version());
+
+        if (requestLogger != CassandraRequestLogger.NO_OP) {
+            requestLogger.onMessage(CassandraMessages.copy(msg));
+        }
+
+        if (!state.isReady()) {
+            if (header.opcode() == CassandraMessages.OPCODE_OPTIONS
+                || header.opcode() == CassandraMessages.OPCODE_STARTUP) {
+                forwardToBackend(msg);
+            } else {
+                pending.add(msg.retain());
+            }
+            return;
+        }
+
+        forwardToBackend(msg);
     }
 
     @Override
@@ -72,15 +96,25 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
         ctx.close();
     }
 
+    private void forwardToBackend(ByteBuf msg) {
+        Channel ch = backend;
+        if (ch == null) {
+            pending.add(msg.retain());
+            return;
+        }
+        ch.writeAndFlush(msg.retain());
+    }
+
     private void flushPending() {
-        if (backend == null || pending.isEmpty()) {
+        Channel ch = backend;
+        if (ch == null || pending.isEmpty()) {
             return;
         }
         for (ByteBuf buf : pending) {
-            backend.write(buf);
+            ch.write(buf);
         }
         pending.clear();
-        backend.flush();
+        ch.flush();
     }
 
     private void releasePending() {
@@ -88,5 +122,12 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
             ReferenceCountUtil.safeRelease(buf);
         }
         pending.clear();
+    }
+
+    private void fail(ChannelHandlerContext ctx, Throwable cause) {
+        log.warn("Frontend failed", cause);
+        releasePending();
+        MessagePump.closeOnFlush(backend);
+        ctx.close();
     }
 }

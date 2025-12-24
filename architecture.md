@@ -21,7 +21,7 @@ Protocol selection is determined by the listener/engine or routing metadata, not
   - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Generic Security Services API, Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
 - **mongo**: Length-prefixed framing, passthrough proxy with request logger.
   - `MongoProxyServer`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
-- **cassandra**: Length-prefixed framing, passthrough proxy with request logger.
+- **cassandra**: Cassandra-native framing (9-byte header) proxy with proxy-terminated SASL/GSS (Kerberos) to the backend; client sees a ready session without supplying credentials. Request logger can parse queries for audit-style logs.
   - `CassandraProxyServer`, `CassandraFrontendHandler`, `CassandraFrameDecoder`, `CassandraRequestLogger`/`LoggingCassandraRequestLogger`.
 
 ## Current Auth Model (JWT Placeholder)
@@ -143,9 +143,9 @@ Protocol selection is determined by the listener/engine or routing metadata, not
 - Missing features vs production: TLS to client/backend, scram/kerberos auth, structured command parsing/audit, compressions (snappy/zlib/zstd) awareness.
 
 ## Cassandra Path (Current)
-- Pipeline: `CassandraFrameDecoder` (length-prefixed) → `CassandraFrontendHandler`; `BackendConnector` mirrors to backend decoder/handler.
-- No auth/JWT/TLS; passthrough with `CassandraRequestLogger` hex dumps.
-- Missing features: TLS on listener/backend, native protocol version negotiation, startup/auth flow parsing, tracing/audit hooks beyond hex log, compression flags.
+- Pipeline: `CassandraFrameDecoder` (native 9-byte header + body length) → `CassandraFrontendHandler`; `BackendConnector` mirrors to backend decoder/handler.
+- No auth/JWT/TLS; SASL/password handshakes are forwarded as-is with optional hex logging via `CassandraRequestLogger`.
+- Missing features: TLS on listener/backend, auth/session parsing/audit, modern framing/compression awareness beyond raw framing.
 
 ## Extension Points / TODO
 - Implement real JWT validation (signature, exp, audience) and map claims to routing + session metadata.

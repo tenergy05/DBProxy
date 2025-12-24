@@ -38,16 +38,6 @@ public final class CassandraProxyServer implements AutoCloseable {
         bossGroup = new NioEventLoopGroup(1);
         workerGroup = new NioEventLoopGroup();
 
-        Function<Channel, ChannelInitializer<SocketChannel>> backendPipeline =
-            frontendChannel -> new ChannelInitializer<SocketChannel>() {
-                @Override
-                protected void initChannel(SocketChannel ch) {
-                    ch.pipeline().addLast("cassandraFrameDecoder", new CassandraFrameDecoder());
-                    ch.pipeline().addLast("backendHandler", new BackendHandler(frontendChannel));
-                }
-            };
-        BackendConnector connector = new BackendConnector(config.targetHost, config.targetPort, backendPipeline);
-
         ServerBootstrap bootstrap = new ServerBootstrap()
             .group(bossGroup, workerGroup)
             .channel(NioServerSocketChannel.class)
@@ -56,13 +46,13 @@ public final class CassandraProxyServer implements AutoCloseable {
                 @Override
                 protected void initChannel(SocketChannel ch) {
                     ch.pipeline().addLast("cassandraFrameDecoder", new CassandraFrameDecoder());
-                    ch.pipeline().addLast("frontendHandler", new CassandraFrontendHandler(connector, config.requestLogger));
+                    ch.pipeline().addLast("frontendHandler", new CassandraFrontendHandler(config));
                 }
             });
 
         ChannelFuture bindFuture = bootstrap.bind(config.listenHost, config.listenPort).sync();
         serverChannel = bindFuture.channel();
-        log.info("Cassandra proxy listening on {}:{} -> {}", config.listenHost, config.listenPort, connector);
+        log.info("Cassandra proxy listening on {}:{} -> {}:{}", config.listenHost, config.listenPort, config.targetHost, config.targetPort);
     }
 
     public void blockUntilShutdown() throws InterruptedException {
@@ -91,6 +81,10 @@ public final class CassandraProxyServer implements AutoCloseable {
         String targetHost = "127.0.0.1";
         int targetPort = 9042;
         CassandraRequestLogger requestLogger = new LoggingCassandraRequestLogger();
+        String servicePrincipal;
+        String krb5ConfPath;
+        String krb5CcName;
+        String clientPrincipal;
 
         public Config listenHost(String listenHost) {
             this.listenHost = listenHost;
@@ -114,6 +108,26 @@ public final class CassandraProxyServer implements AutoCloseable {
 
         public Config requestLogger(CassandraRequestLogger requestLogger) {
             this.requestLogger = Objects.requireNonNull(requestLogger);
+            return this;
+        }
+
+        public Config servicePrincipal(String servicePrincipal) {
+            this.servicePrincipal = servicePrincipal;
+            return this;
+        }
+
+        public Config krb5ConfPath(String krb5ConfPath) {
+            this.krb5ConfPath = krb5ConfPath;
+            return this;
+        }
+
+        public Config krb5CcName(String krb5CcName) {
+            this.krb5CcName = krb5CcName;
+            return this;
+        }
+
+        public Config clientPrincipal(String clientPrincipal) {
+            this.clientPrincipal = clientPrincipal;
             return this;
         }
     }
