@@ -1,7 +1,7 @@
 package com.poc.pamport.cassandra;
 
 import com.poc.pamport.core.audit.AuditRecorder;
-import com.poc.pamport.core.audit.DbSession;
+import com.poc.pamport.core.audit.Session;
 import com.poc.pamport.core.audit.Query;
 import com.poc.pamport.cassandra.protocol.Protocol;
 import io.netty.buffer.ByteBuf;
@@ -31,7 +31,7 @@ final class CassandraHandshakeState {
     private int protocolVersion = -1;
     private final List<ByteBuf> pending = new ArrayList<>();
     private final AtomicBoolean closed = new AtomicBoolean(false);
-    private DbSession session;
+    private Session session;
     private boolean sessionStarted;
 
     CassandraHandshakeState(CassandraEngine.Config config) {
@@ -130,11 +130,11 @@ final class CassandraHandshakeState {
         ctx.writeAndFlush(buf);
     }
 
-    void session(DbSession session) {
+    void session(Session session) {
         this.session = session;
     }
 
-    DbSession session() {
+    Session session() {
         return session;
     }
 

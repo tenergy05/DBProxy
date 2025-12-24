@@ -3,7 +3,7 @@ package com.poc.pamport.postgres;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.poc.pamport.core.audit.AuditRecorder;
-import com.poc.pamport.core.audit.DbSession;
+import com.poc.pamport.core.audit.Session;
 import com.poc.pamport.core.audit.LoggingAuditRecorder;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
@@ -56,7 +56,7 @@ public final class PostgresEngine implements AutoCloseable {
             .childHandler(new ChannelInitializer<SocketChannel>() {
                 @Override
                 protected void initChannel(SocketChannel ch) {
-                    DbSession session = DbSession.from(ch.remoteAddress());
+                    Session session = Session.from(ch.remoteAddress());
                     if (config.tlsContext != null) {
                         ch.pipeline().addLast("ssl", config.tlsContext.newHandler(ch.alloc()));
                     }
@@ -258,7 +258,7 @@ public final class PostgresEngine implements AutoCloseable {
      */
     @FunctionalInterface
     public interface TargetResolver {
-        Route resolve(DbSession session, String jwt);
+        Route resolve(Session session, String jwt);
     }
 
     /**

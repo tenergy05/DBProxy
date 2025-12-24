@@ -22,7 +22,7 @@ public final class LoggingAuditRecorder implements AuditRecorder {
     }
 
     @Override
-    public void onSessionStart(DbSession session, Throwable error) {
+    public void onSessionStart(Session session, Throwable error) {
         Map<String, Object> payload = base(session);
         payload.put("event", error == null ? "db.session.start" : "db.session.start.error");
         if (error != null) {
@@ -32,14 +32,14 @@ public final class LoggingAuditRecorder implements AuditRecorder {
     }
 
     @Override
-    public void onSessionEnd(DbSession session) {
+    public void onSessionEnd(Session session) {
         Map<String, Object> payload = base(session);
         payload.put("event", "db.session.end");
         log.info(payload.toString());
     }
 
     @Override
-    public void onQuery(DbSession session, Query query) {
+    public void onQuery(Session session, Query query) {
         Map<String, Object> payload = base(session);
         payload.put("event", query.error == null ? "db.query" : "db.query.error");
         payload.put("query", query.query);
@@ -56,7 +56,7 @@ public final class LoggingAuditRecorder implements AuditRecorder {
     }
 
     @Override
-    public void onResult(DbSession session, Result result) {
+    public void onResult(Session session, Result result) {
         Map<String, Object> payload = base(session);
         payload.put("event", result.error == null ? "db.result" : "db.result.error");
         payload.put("affected", result.affectedRecords);
@@ -69,13 +69,14 @@ public final class LoggingAuditRecorder implements AuditRecorder {
         log.info(payload.toString());
     }
 
-    private Map<String, Object> base(DbSession session) {
+    private Map<String, Object> base(Session session) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("session_id", session.getId());
         payload.put("client", session.getClientAddress());
         payload.put("db_user", session.getDatabaseUser());
         payload.put("db_name", session.getDatabaseName());
         payload.put("app", session.getApplicationName());
+        payload.put("protocol", session.getProtocol());
         payload.put("start", session.getStartTime());
         payload.put("ts", Instant.now());
         return payload;

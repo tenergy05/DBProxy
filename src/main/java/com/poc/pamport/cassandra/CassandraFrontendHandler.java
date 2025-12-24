@@ -3,7 +3,7 @@ package com.poc.pamport.cassandra;
 import com.poc.pamport.core.BackendConnector;
 import com.poc.pamport.core.MessagePump;
 import com.poc.pamport.core.audit.AuditRecorder;
-import com.poc.pamport.core.audit.DbSession;
+import com.poc.pamport.core.audit.Session;
 import com.poc.pamport.cassandra.protocol.Protocol;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -29,7 +29,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     private final List<ByteBuf> pending = new ArrayList<>();
     private final CassandraHandshakeState state;
     private final AuditRecorder auditRecorder;
-    private DbSession session;
+    private Session session;
     private Channel backend;
 
     CassandraFrontendHandler(CassandraEngine.Config config) {
@@ -42,6 +42,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     @Override
     public void channelActive(ChannelHandlerContext ctx) {
         this.session = auditRecorder.newSession(ctx.channel().remoteAddress());
+        this.session.setProtocol("cassandra");
         state.session(session);
         state.frontend(ctx.channel());
         BackendConnector connector = new BackendConnector(

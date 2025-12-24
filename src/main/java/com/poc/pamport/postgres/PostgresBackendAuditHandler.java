@@ -1,7 +1,7 @@
 package com.poc.pamport.postgres;
 
 import com.poc.pamport.core.audit.AuditRecorder;
-import com.poc.pamport.core.audit.DbSession;
+import com.poc.pamport.core.audit.Session;
 import com.poc.pamport.core.audit.Result;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -18,9 +18,9 @@ public final class PostgresBackendAuditHandler extends SimpleChannelInboundHandl
     private static final Logger log = LoggerFactory.getLogger(PostgresBackendAuditHandler.class);
 
     private final AuditRecorder audit;
-    private final DbSession session;
+    private final Session session;
 
-    public PostgresBackendAuditHandler(AuditRecorder audit, DbSession session) {
+    public PostgresBackendAuditHandler(AuditRecorder audit, Session session) {
         this.audit = audit;
         this.session = session;
     }

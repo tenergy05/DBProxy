@@ -3,7 +3,7 @@ package com.poc.pamport.postgres.auth;
 import com.poc.pamport.core.BackendHandler;
 import com.poc.pamport.core.MessagePump;
 import com.poc.pamport.core.audit.AuditRecorder;
-import com.poc.pamport.core.audit.DbSession;
+import com.poc.pamport.core.audit.Session;
 import com.poc.pamport.postgres.PgMessages;
 import com.poc.pamport.postgres.PostgresBackendAuditHandler;
 import com.poc.pamport.postgres.PostgresFrameDecoder;
@@ -47,7 +47,7 @@ public final class PgGssBackend {
     public static void connect(
         ChannelHandlerContext frontendCtx,
         PostgresEngine.Route route,
-        DbSession session,
+        Session session,
         AuditRecorder auditRecorder,
         Consumer<Channel> onSuccess,
         Consumer<Throwable> onError
@@ -96,7 +96,7 @@ public final class PgGssBackend {
     private static class BackendHandshakeHandler extends ChannelInboundHandlerAdapter {
         private final Channel frontend;
         private final PostgresEngine.Route route;
-        private final DbSession session;
+        private final Session session;
         private final AuditRecorder audit;
         private final Consumer<Channel> onSuccess;
         private final Consumer<Throwable> onError;
@@ -107,7 +107,7 @@ public final class PgGssBackend {
         BackendHandshakeHandler(
             ChannelHandlerContext frontendCtx,
             PostgresEngine.Route route,
-            DbSession session,
+            Session session,
             AuditRecorder audit,
             Consumer<Channel> onSuccess,
             Consumer<Throwable> onError

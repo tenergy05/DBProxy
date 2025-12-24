@@ -3,7 +3,7 @@ package com.poc.pamport.postgres;
 import com.poc.pamport.core.BackendHandler;
 import com.poc.pamport.core.MessagePump;
 import com.poc.pamport.core.audit.AuditRecorder;
-import com.poc.pamport.core.audit.DbSession;
+import com.poc.pamport.core.audit.Session;
 import com.poc.pamport.core.audit.Query;
 import com.poc.pamport.postgres.auth.PgGssBackend;
 import io.netty.buffer.ByteBuf;
@@ -26,7 +26,7 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
 
     private final QueryLogger queryLogger;
     private final AuditRecorder auditRecorder;
-    private final DbSession session;
+    private final Session session;
     private final Predicate<String> jwtValidator;
     private final PostgresEngine.TargetResolver targetResolver;
     private final List<ByteBuf> pending = new ArrayList<>();
@@ -34,11 +34,12 @@ final class FrontendHandler extends SimpleChannelInboundHandler<ByteBuf> {
     private boolean startupSeen;
     private String jwt;
 
-    FrontendHandler(PostgresEngine.TargetResolver targetResolver, QueryLogger queryLogger, AuditRecorder auditRecorder, DbSession session, Predicate<String> jwtValidator) {
+    FrontendHandler(PostgresEngine.TargetResolver targetResolver, QueryLogger queryLogger, AuditRecorder auditRecorder, Session session, Predicate<String> jwtValidator) {
         this.targetResolver = targetResolver;
         this.queryLogger = queryLogger;
         this.auditRecorder = auditRecorder;
         this.session = session;
+        this.session.setProtocol("postgres");
         this.jwtValidator = jwtValidator;
     }
 

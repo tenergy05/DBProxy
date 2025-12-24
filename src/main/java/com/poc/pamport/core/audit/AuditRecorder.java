@@ -6,15 +6,15 @@ import java.net.SocketAddress;
  * AuditRecorder mirrors Teleport's database audit surface in a slimmed-down form.
  */
 public interface AuditRecorder {
-    void onSessionStart(DbSession session, Throwable error);
-    void onSessionEnd(DbSession session);
-    void onQuery(DbSession session, Query query);
-    void onResult(DbSession session, Result result);
+    void onSessionStart(Session session, Throwable error);
+    void onSessionEnd(Session session);
+    void onQuery(Session session, Query query);
+    void onResult(Session session, Result result);
 
     /**
      * Convenience to start a new session context with client address.
      */
-    default DbSession newSession(SocketAddress clientAddress) {
-        return DbSession.from(clientAddress);
+    default Session newSession(SocketAddress clientAddress) {
+        return Session.from(clientAddress);
     }
 }
