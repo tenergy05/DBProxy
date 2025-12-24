@@ -15,6 +15,8 @@ import java.util.Objects;
 import java.util.function.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
+import com.poc.pamport.dbproxy.core.audit.LoggingAuditRecorder;
 
 /**
  * CassandraProxyServer is a placeholder proxy for Cassandra native protocol.
@@ -81,6 +83,7 @@ public final class CassandraProxyServer implements AutoCloseable {
         String targetHost = "127.0.0.1";
         int targetPort = 9042;
         CassandraRequestLogger requestLogger = new LoggingCassandraRequestLogger();
+        AuditRecorder auditRecorder = new LoggingAuditRecorder();
         String servicePrincipal;
         String krb5ConfPath;
         String krb5CcName;
@@ -108,6 +111,11 @@ public final class CassandraProxyServer implements AutoCloseable {
 
         public Config requestLogger(CassandraRequestLogger requestLogger) {
             this.requestLogger = Objects.requireNonNull(requestLogger);
+            return this;
+        }
+
+        public Config auditRecorder(AuditRecorder auditRecorder) {
+            this.auditRecorder = Objects.requireNonNull(auditRecorder);
             return this;
         }
 

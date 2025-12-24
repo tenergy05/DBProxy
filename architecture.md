@@ -143,9 +143,10 @@ Protocol selection is determined by the listener/engine or routing metadata, not
 - Missing features vs production: TLS to client/backend, scram/kerberos auth, structured command parsing/audit, compressions (snappy/zlib/zstd) awareness.
 
 ## Cassandra Path (Current)
-- Pipeline: `CassandraFrameDecoder` (native 9-byte header + body length) → `CassandraFrontendHandler`; `BackendConnector` mirrors to backend decoder/handler.
-- No auth/JWT/TLS; SASL/password handshakes are forwarded as-is with optional hex logging via `CassandraRequestLogger`.
-- Missing features: TLS on listener/backend, auth/session parsing/audit, modern framing/compression awareness beyond raw framing.
+- Pipeline: `CassandraFrameDecoder` (native 9-byte header + body length) → `CassandraFrontendHandler`; backend pipeline mirrors framing + `CassandraBackendHandler`.
+- Proxy-terminated SASL/GSS (Kerberos): proxy answers backend `AUTHENTICATE`/`AUTH_CHALLENGE` with its own GSS tokens (from ticket cache), ignores client `AUTH_RESPONSE`, and forwards `AUTH_SUCCESS/READY` so clients stay unauthenticated. Kerberos config: `servicePrincipal`, `krb5ConfPath`, `krb5CcName`, `clientPrincipal`.
+- Audit: parsed Query/Prepare/Execute/Batch/Register are emitted to `AuditRecorder` (default `LoggingAuditRecorder`); `LoggingCassandraRequestLogger` still dumps headers/hex.
+- Missing: listener/backend TLS, modern framing/compression parsing, richer session metadata (db user/name) in audit.
 
 ## Extension Points / TODO
 - Implement real JWT validation (signature, exp, audience) and map claims to routing + session metadata.

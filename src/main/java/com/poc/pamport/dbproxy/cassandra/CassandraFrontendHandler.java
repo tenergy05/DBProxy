@@ -2,6 +2,8 @@ package com.poc.pamport.dbproxy.cassandra;
 
 import com.poc.pamport.dbproxy.core.BackendConnector;
 import com.poc.pamport.dbproxy.core.MessagePump;
+import com.poc.pamport.dbproxy.core.audit.AuditRecorder;
+import com.poc.pamport.dbproxy.core.audit.DbSession;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
@@ -25,16 +27,21 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     private final CassandraRequestLogger requestLogger;
     private final List<ByteBuf> pending = new ArrayList<>();
     private final CassandraHandshakeState state;
+    private final AuditRecorder auditRecorder;
+    private DbSession session;
     private Channel backend;
 
     CassandraFrontendHandler(CassandraProxyServer.Config config) {
         this.config = config;
         this.requestLogger = config.requestLogger;
         this.state = new CassandraHandshakeState(config);
+        this.auditRecorder = config.auditRecorder;
     }
 
     @Override
     public void channelActive(ChannelHandlerContext ctx) {
+        this.session = auditRecorder.newSession(ctx.channel().remoteAddress());
+        state.session(session);
         state.frontend(ctx.channel());
         BackendConnector connector = new BackendConnector(
             config.targetHost,
@@ -70,15 +77,19 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
         }
 
         if (!state.isReady()) {
-            if (header.opcode() == CassandraMessages.OPCODE_OPTIONS
-                || header.opcode() == CassandraMessages.OPCODE_STARTUP) {
-                forwardToBackend(msg);
-            } else {
-                pending.add(msg.retain());
+            if (header.opcode() == CassandraMessages.OPCODE_AUTH_RESPONSE) {
+                // Client-provided auth is ignored; proxy authenticates on behalf of the client.
+                ReferenceCountUtil.release(msg);
+                return;
             }
+            forwardToBackend(msg);
             return;
         }
 
+        CassandraMessages.ParsedMessage parsed = CassandraMessages.parseForAudit(msg);
+        if (parsed != null) {
+            state.onQuery(parsed);
+        }
         forwardToBackend(msg);
     }
 
@@ -86,6 +97,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
     public void channelInactive(ChannelHandlerContext ctx) {
         releasePending();
         MessagePump.closeOnFlush(backend);
+        state.endSession();
     }
 
     @Override
@@ -93,6 +105,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
         log.warn("Frontend connection failed", cause);
         releasePending();
         MessagePump.closeOnFlush(backend);
+        state.fail(cause);
         ctx.close();
     }
 
@@ -128,6 +141,7 @@ final class CassandraFrontendHandler extends SimpleChannelInboundHandler<ByteBuf
         log.warn("Frontend failed", cause);
         releasePending();
         MessagePump.closeOnFlush(backend);
+        state.fail(cause);
         ctx.close();
     }
 }
