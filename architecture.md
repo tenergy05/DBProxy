@@ -1,391 +1,667 @@
-# DBProxy Architecture (Java/Netty Prototype)
+# JIT Database Access & Recording Architecture
 
-## Goal
-Teleport-style (v18.5.1) database proxy in Java that preserves native wire protocols (Postgres, Mongo, Cassandra) with Teleport-like naming/layout. Clients (psql/JDBC/IntelliJ, mongo shell/driver, cqlsh/driver) remain unaware of auth; the proxy completes SASL/GSS (Kerberos) to the backend using its own credentials.
+## Overview
 
-Protocol selection is determined by the listener/engine or routing metadata, not by sniffing bytes.
-
-## Top-Level Structure
-- **core**: DB-agnostic plumbing.
-  - `BackendConnector`: dials backend using frontend event loop with a supplied pipeline initializer.
-  - `BackendHandler`: streams backend -> frontend.
-  - `MessagePump`: ties lifecycles and flush-closes channels.
-  - `audit/*`: `AuditRecorder`, `Session`, `Query`, `Result`, `LoggingAuditRecorder`.
-- **postgres**: Postgres (PG)-specific framing, parsing, proxy server.
-  - `PostgresEngine`: Netty server bootstrap; per-connection session metadata and routing to backend host/port; optional listener TLS via Netty `SslHandler`.
-  - `PostgresFrameDecoder`: PG frame splitter (startup vs typed messages). Public so other packages can reuse in pipelines.
-  - `PgMessages`: PG frontend parsing (Startup/Cancel/Query/Parse/Bind/Execute/Password/Terminate) and helpers (encode query, auth ok/cleartext, error response).
-  - `FrontendHandler`: parses client messages, ignores client passwords (proxy owns backend auth), resolves backend, forwards frames, emits audit.
-  - `PostgresBackendAuditHandler`: inspects backend CommandComplete/ErrorResponse -> audit result. Public ctor for cross-package pipeline wiring.
-  - `QueryLogger`/`LoggingQueryLogger`: query inspection/rewrite hooks.
-  - `postgres.auth.PgGssBackend`: TLS + GSSAPI (Generic Security Services API, Kerberos) backend connector; builds a backend pipeline with SSL, frame decoder, audit, and a GSS handshake handler.
-- **mongo**: Length-prefixed framing, passthrough proxy with request logger.
-  - `MongoEngine`, `MongoFrontendHandler`, `MongoFrameDecoder`, `MongoRequestLogger`/`LoggingMongoRequestLogger`.
-- **cassandra**: Cassandra-native framing (v3-v6; modern segments) engine with proxy-terminated SASL/GSS (Kerberos) to the backend; client sees a ready session without supplying credentials. Request logger can parse queries for audit-style logs.
-  - `CassandraEngine` (listener), `CassandraFrontendHandler`, `CassandraBackendHandler`, `CassandraFrameDecoder`, `CassandraHandshakeState`, `CassandraGssAuthenticator`, `CassandraFailedHandshakeHandler`, `CassandraRequestLogger`/`LoggingCassandraRequestLogger`.
-
----
-
-## Current Auth Model (proxy-owned)
-- **Postgres**: frontend never authenticates clients. `PasswordMessage` is dropped; the proxy authenticates to the backend with Kerberos via `PgGssBackend` using route/service principal/krb5 settings. `onSessionStart` fires once backend dial/auth completes (success or error).
-- **Cassandra**: client `AUTH_RESPONSE` is parsed for username validation (like Teleport's `validateUsername`), but credentials are ignored. The proxy answers backend `AUTHENTICATE`/`AUTH_CHALLENGE` with its own GSS tokens (`CassandraGssAuthenticator`), forwards `AUTH_SUCCESS/READY`, and clients see a ready session without supplying credentials. Failed handshakes install `CassandraFailedHandshakeHandler` that replies SUPPORTED -> AUTHENTICATE -> AUTH_ERROR before closing.
-- **Mongo**: passthrough with no auth.
-- Prelude/agent (pamjit/tsh equivalent) can be layered later to authenticate/authorize to the proxy; the proxy already mirrors Teleport engine naming/layout and assumes identity is established upstream.
-
----
-
-## Cassandra Implementation (Detailed)
-
-### Architecture Overview
-The Cassandra proxy follows Teleport's architecture closely:
+This document describes a **Just-In-Time (JIT) database access system** with **session recording** capabilities. The architecture enables time-limited, audited database access while keeping database clients (IntelliJ, DBeaver, psql, cqlsh, mongosh) completely unmodified.
 
 ```
-+----------+      No Auth       +---------------+    Kerberos/SASL    +-----------+
-|  Client  | -----------------> | Cassandra     | -----------------> | Cassandra |
-|  (cqlsh) |   AUTH_RESPONSE    |    Proxy      |   AUTH_RESPONSE    |  Backend  |
-|          |   validated but    |    (Java)     |   with GSS token   |           |
-+----------+   credentials      +---------------+                    +-----------+
-               ignored                 |
-                                       +-- Audit: QUERY/PREPARE/EXECUTE/BATCH
-                                       +-- Session: start/end
-```
-
-### Key Components
-
-#### CassandraFrameDecoder
-Handles protocol framing with Teleport-matching features:
-
-| Feature | Implementation |
-|---------|---------------|
-| **Separate read/write framing** | `modernFramingRead` / `modernFramingWrite` flags allow client v5 / server v4 mismatch |
-| **Compression support** | LZ4 and Snappy via `updateCompression(String)` after parsing STARTUP |
-| **Modern framing switch** | Triggered on READY/AUTHENTICATE (like Teleport's `maybeSwitchToModernLayout`) |
-| **Protocol versions** | Supports v3, v4, v5, v6 with automatic segment handling |
-
-#### CassandraHandshakeState
-Tracks per-connection state during handshake:
-
-- **Compression**: Captured from STARTUP, applied to both frontend/backend decoders
-- **Username validation**: `validateClientAuth()` validates client username matches expected session user (like Teleport)
-- **Driver info**: Captures DRIVER_NAME/DRIVER_VERSION for session/audit
-- **Protocol version**: Tracks negotiated version for correct framing
-- **GSS authenticator**: Manages Kerberos token generation
-
-#### CassandraFrontendHandler
-Handles client-side protocol:
-
-1. **OPTIONS**: Forwarded to backend
-2. **STARTUP**: Parsed to extract compression, driver info; forwarded to backend
-3. **AUTH_RESPONSE**:
-   - Parsed to extract username/password (PasswordAuthenticator format)
-   - Username validated if `validateUsername` config is enabled
-   - Credentials ignored - proxy handles backend auth
-   - Auth error sent if validation fails
-
-#### CassandraBackendHandler
-Handles backend-side protocol:
-
-1. **AUTHENTICATE**: Triggers GSS handshake, switches to modern framing
-2. **AUTH_CHALLENGE**: Continues GSS challenge-response
-3. **AUTH_SUCCESS**: Marks session ready, flushes pending
-4. **READY**: Marks session ready (no-auth case)
-5. **ERROR**: Forwarded to client, connection closed
-
-### Protocol Flow (SASL/GSS)
-
-```
-Client -> Proxy: OPTIONS
-Proxy -> Backend: OPTIONS
-Backend -> Proxy: SUPPORTED
-Proxy -> Client: SUPPORTED
-
-Client -> Proxy: STARTUP (compression, driver info captured)
-Proxy -> Backend: STARTUP
-
-Backend -> Proxy: AUTHENTICATE
-Proxy -> Client: AUTHENTICATE
-Proxy -> Backend: AUTH_RESPONSE (GSS initial token)
-
-Backend -> Proxy: AUTH_CHALLENGE
-Proxy -> Client: AUTH_CHALLENGE
-Client -> Proxy: AUTH_RESPONSE (validated, ignored)
-Proxy -> Backend: AUTH_RESPONSE (GSS response token)
-
-... repeat AUTH_CHALLENGE/RESPONSE until ...
-
-Backend -> Proxy: AUTH_SUCCESS
-Proxy -> Client: AUTH_SUCCESS
--- Session Ready --
-```
-
-### Configuration Options
-
-```java
-CassandraEngine.Config config = new CassandraEngine.Config()
-    .listenHost("0.0.0.0")
-    .listenPort(19042)
-    .targetHost("cassandra.example.com")
-    .targetPort(9042)
-    // Kerberos settings
-    .servicePrincipal("cassandra/cassandra.example.com")
-    .krb5ConfPath("/etc/krb5.conf")
-    .krb5CcName("/tmp/krb5cc_proxy")
-    .clientPrincipal("proxy@EXAMPLE.COM")
-    // Username validation (like Teleport)
-    .expectedUsername("allowed_user")
-    .validateUsername(true);
-```
-
-### Robustness Features
-
-| Feature | Description |
-|---------|-------------|
-| **Multi-version support** | v3-v6 clients handled correctly |
-| **Compression passthrough** | LZ4/Snappy decompressed for parsing, forwarded as-is |
-| **Stream ID preservation** | All responses use correct client stream ID |
-| **Version mismatch handling** | Separate read/write framing modes |
-| **Failed handshake** | Protocol-compliant error responses |
-| **Backend connect failure** | Proper error propagation to client |
-
----
-
-## Postgres Implementation (Detailed)
-
-### Architecture Overview
-
-```
-+----------+      No Auth       +---------------+    Kerberos/GSSAPI  +-----------+
-|  Client  | -----------------> |   Postgres    | -----------------> | Postgres  |
-|  (psql)  |   PasswordMessage  |    Proxy      |   GSS tokens       |  Backend  |
-|          |   dropped          |    (Java)     |                    |           |
-+----------+                    +---------------+                    +-----------+
-                                       |
-                                       +-- Audit: QUERY/PREPARE/EXECUTE
-                                       +-- Result: CommandComplete/Error
-```
-
-### Key Components
-
-#### PostgresFrameDecoder
-- Handles startup frame (length-prefixed, no type byte)
-- Handles regular frames (type byte + length)
-- State machine for startup vs post-startup
-
-#### FrontendHandler
-- Parses StartupMessage for user/database/application_name
-- Drops PasswordMessage (proxy owns auth)
-- Forwards Query/Parse/Bind/Execute with audit hooks
-- Buffers frames until backend connected
-
-#### PgGssBackend
-- Builds TLS connection (client mode, TLS 1.2/1.3)
-- Handles AuthenticationGSS/GSSContinue handshake
-- Uses JGSS with ticket cache (`useTicketCache=true`)
-- Configurable: servicePrincipal, krb5ConfPath, krb5CcName, clientPrincipal
-
-#### PostgresBackendAuditHandler
-- Inspects CommandComplete -> `onResult` with rows affected
-- Inspects ErrorResponse -> `onResult` with error message
-- Forwards all frames to frontend
-
-### Configuration
-
-```java
-PostgresEngine.Config config = new PostgresEngine.Config()
-    .listenHost("0.0.0.0")
-    .listenPort(15432)
-    .addRoute("*", new PostgresEngine.Route(
-        "pg.example.com", 5432,
-        "db_user", "database_name",
-        "/etc/ssl/pg-ca.pem", "pg.example.com",
-        "/tmp/krb5cc_proxy", "/etc/krb5.conf",
-        "proxy@EXAMPLE.COM", "postgres/pg.example.com"
-    ));
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           ARCHITECTURE OVERVIEW                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│   ┌──────────┐  HTTPS  ┌──────────────┐                                     │
+│   │  jit-ui  │────────▶│  jit-server  │                                     │
+│   │  (Web)   │         │ (Control)    │                                     │
+│   └──────────┘         └──────▲───────┘                                     │
+│                               │                                              │
+│                               │ HTTPS (authorize, session lifecycle)         │
+│                               │                                              │
+│   ┌──────────┐  TLS    ┌──────┴───────┐  TLS+GSSAPI  ┌──────────────┐       │
+│   │  pamjit  │────────▶│  jit-proxy   │─────────────▶│   Database   │       │
+│   │ (Agent)  │ prelude │ (Data Plane) │   record     │ (CockroachDB │       │
+│   └────▲─────┘         └──────┬───────┘              │  Cassandra   │       │
+│        │                      │                       │  MongoDB)    │       │
+│        │ localhost            │ HTTPS                 └──────────────┘       │
+│   ┌────┴─────┐                ▼                                              │
+│   │  Client  │         ┌──────────────┐                                     │
+│   └──────────┘         │ cred-service │                                     │
+│                        │ (Credentials)│                                     │
+│   IntelliJ / DBeaver   └──────────────┘                                     │
+│   psql / cqlsh / mongosh                                                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Mongo Implementation (Detailed)
+## Glossary
 
-### Architecture Overview
-Simple passthrough proxy with length-prefixed framing:
-
-```
-+----------+                    +---------------+                    +-----------+
-|  Client  | -----------------> |    Mongo      | -----------------> |   Mongo   |
-|  (shell) |   passthrough      |    Proxy      |   passthrough      |  Backend  |
-+----------+                    +---------------+                    +-----------+
-                                       |
-                                       +-- Request logging (hex dump)
-```
-
-### Components
-- `MongoFrameDecoder`: int32 length-prefixed framing
-- `MongoFrontendHandler`: connects backend, forwards messages
-- `MongoRequestLogger`: optional hex dump of requests
-
-### Missing vs Cassandra/Postgres
-- No authentication (passthrough)
-- No structured audit events
-- No TLS support
-- No message parsing beyond framing
+| Acronym | Meaning |
+|---------|---------|
+| **JIT** | Just-In-Time (time-limited access) |
+| **JWT** | JSON Web Token |
+| **TLS** | Transport Layer Security |
+| **mTLS** | Mutual TLS (client and server certificates) |
+| **SCIM** | System for Cross-domain Identity Management |
+| **GSSAPI** | Generic Security Services API (Kerberos mechanism) |
+| **TGT** | Ticket-Granting Ticket (Kerberos credential) |
+| **ALPN** | Application-Layer Protocol Negotiation |
+| **SNI** | Server Name Indication |
+| **RBAC** | Role-Based Access Control |
 
 ---
 
-## Audit System
+## Design Goals
 
-### AuditRecorder Interface
-```java
-public interface AuditRecorder {
-    Session newSession(SocketAddress clientAddress);
-    void onSessionStart(Session session, Throwable error);
-    void onSessionEnd(Session session);
-    void onQuery(Session session, Query query);
-    void onResult(Session session, Result result);
+1. **Zero client modification** - Database clients remain unchanged
+2. **Centralized authorization** - jit-server is the single source of truth
+3. **Complete audit trail** - All queries/commands recorded per session
+4. **Time-bounded access** - Grants expire automatically via SCIM
+5. **Multi-protocol support** - Postgres, Cassandra, MongoDB
+
+---
+
+## Components
+
+### Component Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              CONTROL PLANE                                       │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                           jit-server                                     │    │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │    │
+│  │  │ JWT Validation│ │  Entitlement │ │    SCIM      │ │   State      │   │    │
+│  │  │              │ │    Check     │ │  Grants/     │ │   Machine    │   │    │
+│  │  │              │ │              │ │  Revokes     │ │              │   │    │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘   │    │
+│  │                              │                                          │    │
+│  │                              ▼                                          │    │
+│  │                    ┌──────────────────┐                                 │    │
+│  │                    │   CockroachDB    │                                 │    │
+│  │                    │  (Grant State)   │                                 │    │
+│  │                    └──────────────────┘                                 │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                               DATA PLANE                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                            jit-proxy                                     │    │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │    │
+│  │  │   Prelude    │ │  Protocol    │ │   Session    │ │    Audit     │   │    │
+│  │  │  Validator   │ │   Engines    │ │   Recorder   │ │   Reporter   │   │    │
+│  │  │              │ │ (PG/C*/Mongo)│ │   (JSONL)    │ │              │   │    │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘   │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENT SIDE                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                             pamjit                                       │    │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                     │    │
+│  │  │   Localhost  │ │     TLS      │ │   Prelude    │                     │    │
+│  │  │   Listener   │ │   Connect    │ │    Sender    │                     │    │
+│  │  │              │ │              │ │              │                     │    │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘                     │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1. jit-ui (Web Interface)
+
+**Role**: User-facing portal for access requests
+
+- Collects asset selection, host/port, duration, ticket, roles
+- Calls jit-server HTTPS endpoints
+- Displays approval results and grant identifiers
+
+### 2. jit-server (Control Plane)
+
+**Role**: Authorization hub and state machine
+
+- Validates JWT identity
+- Validates entitlements and ticket rules
+- Orchestrates SCIM grants/revocations
+- Stores authoritative approval state in CockroachDB
+- Computes `bundle_id` for session attribution
+
+### 3. cred-service (Credential Provider)
+
+**Role**: Runtime credential distribution
+
+- Provides Kerberos TGT/credential cache for database auth
+- Returns tokens/credentials based on database type
+- **Only called by jit-proxy** - no other component accesses cred-service directly
+- jit-proxy authenticates to cred-service via mTLS or service token
+
+### 4. jit-proxy (Data Plane)
+
+**Role**: Database proxy with recording
+
+- Accepts TLS connections from pamjit
+- Validates prelude (JWT, asset, anti-replay)
+- Authorizes via jit-server
+- Fetches credentials from cred-service
+- Connects to backend database (TLS + GSSAPI)
+- Records all queries/commands to JSONL
+- Reports session lifecycle to jit-server
+
+### 5. pamjit (Local Agent)
+
+**Role**: Client-side forwarder (tsh-like)
+
+- Runs localhost listener for database clients
+- Opens TLS connection to jit-proxy
+- Sends authentication prelude
+- Forwards bytes bidirectionally (protocol-agnostic)
+
+---
+
+## Identifiers
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          IDENTIFIER RELATIONSHIPS                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  User Request                    DB Connection                               │
+│       │                               │                                      │
+│       ▼                               ▼                                      │
+│  ┌─────────────┐              ┌──────────────┐                              │
+│  │ activityUID │              │ db_session_id│                              │
+│  │ (per grant) │              │ (per TCP conn)│                             │
+│  └──────┬──────┘              └──────┬───────┘                              │
+│         │                            │                                       │
+│         │    ┌───────────────────────┘                                       │
+│         │    │                                                               │
+│         ▼    ▼                                                               │
+│  ┌─────────────────────────────────────┐                                     │
+│  │             bundle_id               │                                     │
+│  │  SHA256(sorted(active_activityUIDs))│                                     │
+│  │                                     │                                     │
+│  │  Labels recordings with effective   │                                     │
+│  │  privileges at session start        │                                     │
+│  └─────────────────────────────────────┘                                     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Identifier | Created By | Purpose |
+|------------|------------|---------|
+| `activityUID` | jit-server | Tracks individual grant request/approval |
+| `db_session_id` | jit-proxy | Identifies single TCP database connection |
+| `bundle_id` | jit-server | Labels session with set of active grants |
+
+### Why bundle_id?
+
+A user may have multiple concurrent grants for the same asset (multiple roles approved at different times). At DB session start, effective privileges are the **union** of all active grants. `bundle_id` labels that union for accurate post-activity attribution.
+
+---
+
+## End-to-End Workflow
+
+### Phase 1: Access Request (Control Plane)
+
+```
+┌──────────┐     ┌──────────┐     ┌─────────────┐     ┌──────────┐
+│   User   │     │  jit-ui  │     │ jit-server  │     │   SCIM   │
+└────┬─────┘     └────┬─────┘     └──────┬──────┘     └────┬─────┘
+     │                │                   │                 │
+     │ 1. Request     │                   │                 │
+     │    Access      │                   │                 │
+     ├───────────────▶│                   │                 │
+     │                │                   │                 │
+     │                │ 2. POST /request  │                 │
+     │                ├──────────────────▶│                 │
+     │                │                   │                 │
+     │                │                   │ 3. Validate JWT │
+     │                │                   │    Entitlements │
+     │                │                   │    Ticket Rules │
+     │                │                   │                 │
+     │                │                   │ 4. Grant Role   │
+     │                │                   ├────────────────▶│
+     │                │                   │                 │
+     │                │                   │◀────────────────┤
+     │                │                   │                 │
+     │                │ 5. activityUID(s) │                 │
+     │                │◀──────────────────┤                 │
+     │                │                   │                 │
+     │ 6. Grant       │                   │                 │
+     │    Status      │                   │                 │
+     │◀───────────────┤                   │                 │
+     │                │                   │                 │
+```
+
+### Phase 2: Database Connection (Data Plane)
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────────┐  ┌───────────┐  ┌──────────┐
+│  Client  │  │  pamjit  │  │ jit-proxy│  │jit-server │  │cred-service│  │ Database │
+└────┬─────┘  └────┬─────┘  └────┬─────┘  └─────┬─────┘  └─────┬─────┘  └────┬─────┘
+     │             │             │              │              │              │
+     │             │ 1. Start    │              │              │              │
+     │             │    Listener │              │              │              │
+     │             │ (localhost) │              │              │              │
+     │             │             │              │              │              │
+     │ 2. Connect  │             │              │              │              │
+     ├────────────▶│             │              │              │              │
+     │             │             │              │              │              │
+     │             │ 3. TLS      │              │              │              │
+     │             ├────────────▶│              │              │              │
+     │             │             │              │              │              │
+     │             │ 4. Prelude  │              │              │              │
+     │             │ (JWT,asset, │              │              │              │
+     │             │  ts,nonce)  │              │              │              │
+     │             ├────────────▶│              │              │              │
+     │             │             │              │              │              │
+     │             │             │ 5. Authorize │              │              │
+     │             │             ├─────────────▶│              │              │
+     │             │             │              │              │              │
+     │             │             │ 6. bundle_id │              │              │
+     │             │             │◀─────────────┤              │              │
+     │             │             │              │              │              │
+     │             │             │ 7. Get Creds │              │              │
+     │             │             ├─────────────────────────────▶              │
+     │             │             │              │              │              │
+     │             │             │ 8. TGT/Cache │              │              │
+     │             │             │◀─────────────────────────────┤              │
+     │             │             │              │              │              │
+     │             │             │ 9. TLS + GSSAPI Connect     │              │
+     │             │             ├─────────────────────────────────────────────▶
+     │             │             │              │              │              │
+     │             │ 10. ACK     │              │              │              │
+     │             │◀────────────┤              │              │              │
+     │             │             │              │              │              │
+     │ 11. Ready   │             │              │              │              │
+     │◀────────────┤             │              │              │              │
+     │             │             │              │              │              │
+     │ 12. SQL/CQL │ forward     │ forward + record            │              │
+     ├────────────▶├────────────▶├─────────────────────────────────────────────▶
+     │             │             │              │              │              │
+     │◀────────────┼─────────────┼◀─────────────────────────────────────────────┤
+     │  Results    │             │              │              │              │
+```
+
+### Phase 3: Session End
+
+```
+┌──────────┐  ┌──────────┐  ┌───────────┐  ┌─────────────────────┐
+│  Client  │  │ jit-proxy│  │jit-server │  │post-activity-review │
+└────┬─────┘  └────┬─────┘  └─────┬─────┘  └──────────┬──────────┘
+     │             │              │                   │
+     │ Disconnect  │              │                   │
+     ├────────────▶│              │                   │
+     │             │              │                   │
+     │             │ Close        │                   │
+     │             │ Recording    │                   │
+     │             │              │                   │
+     │             │ Session End  │                   │
+     │             │ Summary      │                   │
+     │             ├─────────────▶│                   │
+     │             │              │                   │
+     │             │              │ Forward to        │
+     │             │              │ Review Server     │
+     │             │              ├──────────────────▶│
+     │             │              │                   │
+```
+
+---
+
+## Prelude Protocol
+
+### Transport
+
+- TLS over TCP (server-auth minimum)
+- jit-proxy requires TLS from byte 0
+
+### Message Format
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      PRELUDE MESSAGE                            │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┬────────────────────────────────────────────┐  │
+│  │ uint32 len  │              JSON payload                   │  │
+│  └─────────────┴────────────────────────────────────────────┘  │
+│                                                                 │
+│  Payload Fields:                                                │
+│  ┌────────────────────────────────────────────────────────┐    │
+│  │ {                                                       │    │
+│  │   "version": 1,                                         │    │
+│  │   "jwt": "<user-jwt-token>",                           │    │
+│  │   "asset_uid": "asset-uuid",                           │    │
+│  │   "target_host": "db.example.com",                     │    │
+│  │   "target_port": 26257,                                │    │
+│  │   "ts_epoch_ms": 1730000000000,                        │    │
+│  │   "nonce_b64": "random-base64-nonce"                   │    │
+│  │ }                                                       │    │
+│  └────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Anti-Replay Protection
+
+| Field | Purpose | Storage |
+|-------|---------|---------|
+| `ts` | Timestamp within 120s window | Not stored |
+| `nonce` | Unique per request | TTL cache (~120s) |
+
+---
+
+## jit-proxy Authorization API
+
+### Request: POST `/api/v1/db/connect/authorize`
+
+```json
+{
+  "user_id": "derived-from-jwt-sub",
+  "asset_uid": "asset-uuid",
+  "target_host": "db.example.com",
+  "target_port": 26257,
+  "ts_epoch_ms": 1730000000000,
+  "nonce_b64": "..."
 }
 ```
 
-### Session Fields (Teleport-compatible)
-- `id`, `startTime`, `clientAddress`
-- `databaseUser`, `databaseName`, `applicationName`
-- `protocol`, `databaseType`, `databaseProtocol`, `databaseService`
-- `clusterName`, `hostId`, `identityUser`
-- `autoCreateUserMode`, `databaseRoles`, `startupParameters`
-- `lockTargets`, `postgresPid`, `userAgent`
+### Response (Success)
 
-### Audit Events by Protocol
-
-| Protocol | SessionStart | Query | Result | SessionEnd |
-|----------|--------------|-------|--------|------------|
-| Postgres | Backend auth complete/fail | Query message | CommandComplete/Error | Disconnect |
-| Cassandra | READY/AUTH_SUCCESS | QUERY/PREPARE/EXECUTE/BATCH/REGISTER | - | Disconnect |
-| Mongo | - | - | - | - |
-
----
-
-## Build & Run
-
-### Build
-```bash
-mvn -DskipTests package
+```json
+{
+  "allowed": true,
+  "bundle_id": "sha256-hash-of-sorted-activity-uids",
+  "bundle_expires_at": "2024-11-01T12:00:00Z",
+  "db_type": "cockroachdb"
+}
 ```
 
-### Run Postgres Proxy
-```bash
-java -jar target/dbproxy-0.1.0-SNAPSHOT.jar /path/to/config.json
-```
+### Response (Denied)
 
-### Run Cassandra Proxy
-```bash
-java -cp target/dbproxy-0.1.0-SNAPSHOT.jar com.poc.pamport.cassandra.CassandraEngine
-```
-
-### Run Mongo Proxy
-```bash
-java -cp target/dbproxy-0.1.0-SNAPSHOT.jar com.poc.pamport.mongo.MongoEngine
+```json
+{
+  "allowed": false,
+  "reason": "no_active_grants"
+}
 ```
 
 ---
 
-## Dependencies
+## Protocol Engines
 
-```xml
-<dependencies>
-    <dependency>
-        <groupId>io.netty</groupId>
-        <artifactId>netty-all</artifactId>
-        <version>4.1.108.Final</version>
-    </dependency>
-    <dependency>
-        <groupId>com.datastax.oss</groupId>
-        <artifactId>native-protocol</artifactId>
-        <version>1.5.0</version>
-    </dependency>
-    <dependency>
-        <groupId>org.lz4</groupId>
-        <artifactId>lz4-java</artifactId>
-        <version>1.8.0</version>
-    </dependency>
-    <dependency>
-        <groupId>org.xerial.snappy</groupId>
-        <artifactId>snappy-java</artifactId>
-        <version>1.1.10.5</version>
-    </dependency>
-    <!-- SLF4J, Jackson for config -->
-</dependencies>
+### Engine Selection
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    PROTOCOL ENGINE SELECTION                     │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  assetUID ──▶ jit-server ──▶ db_type ──▶ Engine Selection       │
+│                                                                  │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐        │
+│  │   Postgres  │     │  Cassandra  │     │   MongoDB   │        │
+│  │   Engine    │     │   Engine    │     │   Engine    │        │
+│  └──────┬──────┘     └──────┬──────┘     └──────┬──────┘        │
+│         │                   │                   │                │
+│         ▼                   ▼                   ▼                │
+│  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐        │
+│  │ TLS+GSSAPI  │     │ TLS+SASL/   │     │ TLS+SCRAM   │        │
+│  │ Auth        │     │ Kerberos    │     │ (optional)  │        │
+│  └─────────────┘     └─────────────┘     └─────────────┘        │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Postgres/CockroachDB Engine
+
+| Feature | Implementation |
+|---------|----------------|
+| Framing | Startup + typed messages |
+| Audit | Query/Parse text, CommandComplete, ErrorResponse |
+| Auth | TLS + GSSAPI via cred-service TGT |
+
+### Cassandra Engine
+
+| Feature | Implementation |
+|---------|----------------|
+| Framing | Native protocol v3-v6, modern segments |
+| Audit | QUERY/PREPARE CQL text, EXECUTE (requires prepared stmt mapping) |
+| Auth | TLS + SASL/Kerberos |
+
+### MongoDB Engine
+
+| Feature | Implementation |
+|---------|----------------|
+| Framing | Length-prefixed BSON |
+| Audit | Command names, collections (not full documents) |
+| Auth | TLS + SCRAM (deployment-dependent) |
+
+---
+
+## jit-proxy Netty Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    NETTY THREADING MODEL                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────┐                                            │
+│  │   Boss Group    │  1 thread (acceptor)                       │
+│  │                 │                                            │
+│  └────────┬────────┘                                            │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                    Worker Group                          │    │
+│  │                  (~2 x CPU threads)                      │    │
+│  │                                                          │    │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │    │
+│  │  │ EventLoop 1 │  │ EventLoop 2 │  │ EventLoop N │      │    │
+│  │  │             │  │             │  │             │      │    │
+│  │  │ ┌─────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │      │    │
+│  │  │ │Frontend │ │  │ │Frontend │ │  │ │Frontend │ │      │    │
+│  │  │ │ Channel │ │  │ │ Channel │ │  │ │ Channel │ │      │    │
+│  │  │ └────┬────┘ │  │ └────┬────┘ │  │ └────┬────┘ │      │    │
+│  │  │      │      │  │      │      │  │      │      │      │    │
+│  │  │ ┌────▼────┐ │  │ ┌────▼────┐ │  │ ┌────▼────┐ │      │    │
+│  │  │ │Backend  │ │  │ │Backend  │ │  │ │Backend  │ │      │    │
+│  │  │ │ Channel │ │  │ │ Channel │ │  │ │ Channel │ │      │    │
+│  │  │ └─────────┘ │  │ └─────────┘ │  │ └─────────┘ │      │    │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘      │    │
+│  │                                                          │    │
+│  │  Frontend + Backend on SAME EventLoop for efficiency     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │              Blocking Operations Executor                │    │
+│  │  - HTTPS calls to jit-server/cred-service                │    │
+│  │  - GSSAPI token generation (if slow)                    │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Non-Blocking Rule
+
+**Never block the EventLoop thread:**
+- HTTPS calls must be async or offloaded
+- GSSAPI token generation offloaded if slow
+- Results written back on EventLoop
+
+---
+
+## Session Recording
+
+### Recording Format (JSONL)
+
+```json
+{"ts":"2024-11-01T10:00:00Z","type":"SESSION_START","db_session_id":"uuid","bundle_id":"hash"}
+{"ts":"2024-11-01T10:00:01Z","type":"QUERY","text":"SELECT * FROM users WHERE id = $1"}
+{"ts":"2024-11-01T10:00:01Z","type":"RESULT","rows_affected":1}
+{"ts":"2024-11-01T10:00:02Z","type":"QUERY","text":"UPDATE users SET name = $1 WHERE id = $2"}
+{"ts":"2024-11-01T10:00:02Z","type":"RESULT","rows_affected":1}
+{"ts":"2024-11-01T10:00:05Z","type":"SESSION_END","queries":2,"errors":0}
+```
+
+### Session Summary (to jit-server)
+
+```json
+{
+  "db_session_id": "uuid",
+  "bundle_id": "hash",
+  "start_time": "2024-11-01T10:00:00Z",
+  "end_time": "2024-11-01T10:00:05Z",
+  "status": "COMPLETED",
+  "query_count": 2,
+  "error_count": 0,
+  "recording_ref": "s3://bucket/recordings/uuid.jsonl"
+}
 ```
 
 ---
 
-## Gaps vs Teleport Go Implementation
+## Security Boundaries
 
-### Cassandra
-| Feature | Teleport | Java Proxy |
-|---------|----------|------------|
-| Protocol versions | v3-v6 | v3-v6 |
-| Modern framing | Full | Full |
-| Compression | LZ4/Snappy | LZ4/Snappy |
-| Username validation | Yes | Yes |
-| AWS SigV4 auth | Yes | No |
-| TLS to backend | Yes | No |
-| TLS to frontend | Yes | No |
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     SECURITY BOUNDARIES                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │                    User Workstation                      │    │
+│  │  ┌─────────┐          ┌─────────┐                       │    │
+│  │  │ Client  │ ───────▶ │ pamjit  │                       │    │
+│  │  └─────────┘localhost └────┬────┘                       │    │
+│  └────────────────────────────┼────────────────────────────┘    │
+│                               │ TLS (server-auth)                │
+│  ═══════════════════════════════════════════════════════════    │
+│                               │                                  │
+│  ┌────────────────────────────▼────────────────────────────┐    │
+│  │                    DMZ / Proxy Zone                      │    │
+│  │                   ┌─────────────┐                        │    │
+│  │                   │  jit-proxy  │                        │    │
+│  │                   └──────┬──────┘                        │    │
+│  └──────────────────────────┼──────────────────────────────┘    │
+│                             │ mTLS / Service Token               │
+│  ═══════════════════════════════════════════════════════════    │
+│                             │                                    │
+│  ┌──────────────────────────▼──────────────────────────────┐    │
+│  │                   Internal Services                      │    │
+│  │  ┌───────────┐   ┌─────────────┐   ┌──────────────┐     │    │
+│  │  │jit-server │   │ cred-service │   │   Database   │     │    │
+│  │  │  (HTTPS)  │   │   (HTTPS)   │   │ (TLS+GSSAPI) │     │    │
+│  │  └───────────┘   └─────────────┘   └──────────────┘     │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### Postgres
-| Feature | Teleport | Java Proxy |
-|---------|----------|------------|
-| GSS auth | Yes | Yes |
-| SCRAM/MD5 auth | Yes | No |
-| Cancel flow | Yes | No |
-| SSL negotiation | Full | Deny only |
-| Statement tracking | Yes | No |
+### Connection Security
 
-### Mongo
-| Feature | Teleport | Java Proxy |
-|---------|----------|------------|
-| Auth | SCRAM-SHA-256 | No |
-| TLS | Yes | No |
-| Command parsing | Yes | No |
-| Audit events | Yes | No |
+| Path | Security |
+|------|----------|
+| pamjit → jit-proxy | TLS (server-auth minimum) |
+| jit-proxy → jit-server | HTTPS (mTLS or service token) |
+| jit-proxy → cred-service | HTTPS (mTLS or service token) |
+| jit-proxy → Database | TLS + GSSAPI/SASL |
 
----
+### Target Validation
 
-## Extension Points / TODO
-
-1. **TLS Support**: Add server-side TLS for frontend connections, client-side TLS for Cassandra/Mongo backends
-2. **AWS SigV4**: Implement for AWS Keyspaces (Cassandra)
-3. **Mongo Auth**: Add SCRAM-SHA-256 authentication
-4. **Postgres Cancel**: Implement PID/secret-based cancel routing
-5. **Postgres SCRAM**: Add SCRAM-SHA-256 backend auth option
-6. **Structured Mongo Audit**: Parse MongoDB commands for audit events
-7. **Result Auditing**: Parse Cassandra RESULT frames for audit
-8. **RBAC Integration**: Connect to external authorization service
-
----
-
-## Parallels to Teleport's Implementation
-
-### Client side (Teleport tsh)
-Opens a local TCP listener per database, authenticates to Teleport Proxy over mTLS using Teleport-issued client certs/ALPN/SNI, and forwards raw DB protocol. tsh does not parse Postgres/Mongo/Cassandra.
-
-### Proxy side (Teleport Proxy)
-Accepts DB protocol, authorizes Teleport identity, forwards startup to DB service over reverse tunnel, streams bytes; it does not handle target DB TLS.
-
-### DB service side (Teleport engines)
-Protocol-aware; parses startup, RBAC check, optional auto user provision, connects to actual DB using per-DB TLS config, sends protocol auth OK to the client, relays messages, emits audit events.
-
-### This Java Proxy
-Acts like Teleport's DB service side - protocol-aware, handles backend auth, emits audit. Can be deployed as a standalone proxy or integrated with an external auth/authz layer.
+- Allowlist ports per db_type (e.g., 26257, 5432, 9042, 27017)
+- Block localhost/link-local if jit-proxy in privileged zone
+- Validate target against asset metadata
 
 ---
 
-## Session Tracking (Current Java Proxy)
+## Failure Handling
 
-Per connection: `Session` with:
-- ID, start time, client address
-- db/user/app from startup
-- Teleport-like metadata: clusterName, hostId, databaseService/type/protocol, identityUser, autoCreateUserMode, databaseRoles, startupParameters, lockTargets, postgresPid, userAgent
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     FAILURE SCENARIOS                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Failure Point              │ Action                            │
+│  ───────────────────────────┼─────────────────────────────────  │
+│  JWT validation fails       │ Reject prelude, close connection  │
+│  ts/nonce replay detected   │ Reject prelude, close connection  │
+│  jit-server authorize fails │ Reject before DB bytes forwarded  │
+│  cred-service fails          │ Reject, optionally report attempt │
+│  DB connect/auth fails      │ Report session ABORTED, close     │
+│  DB protocol error          │ Log error, forward to client      │
+│  Session expires mid-flight │ Option: allow continue or close   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-Lifecycle:
-- `onSessionStart` on backend auth complete (PG) or READY/AUTH_SUCCESS (Cassandra)
-- `onSessionEnd` on disconnect
-- PG/Mongo/Cassandra share the same audit surface
+---
+
+## Implementation Phases
+
+### Phase 1: Core Infrastructure
+1. Implement pamjit localhost listener + TLS to jit-proxy
+2. Implement jit-proxy prelude validator (JWT + ts/nonce)
+3. Implement jit-proxy → jit-server authorize API
+
+### Phase 2: Credential & Database
+4. Implement jit-proxy → cred-service credential fetch
+5. Implement Postgres/CockroachDB engine with TLS + GSSAPI
+6. Add Query/Result/Error recording
+
+### Phase 3: Reporting
+7. Add session start/end reporting to jit-server
+8. Add recording storage and reference passing
+
+### Phase 4: Multi-Protocol
+9. Add Cassandra engine with SASL/Kerberos
+10. Add MongoDB engine with command parsing
+
+### Phase 5: Hardening
+11. Target/port allowlisting
+12. Rate limiting
+13. Session expiry enforcement
+14. Postgres cancel request support
+
+---
+
+## Data Flow Summary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    MINIMAL DATA EXCHANGE                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  jit-server returns (authorization):                            │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │ { allowed, bundle_id, bundle_expires_at, db_type }     │     │
+│  └────────────────────────────────────────────────────────┘     │
+│                                                                  │
+│  jit-proxy sends (session lifecycle):                           │
+│  ┌────────────────────────────────────────────────────────┐     │
+│  │ { db_session_id, bundle_id, start/end, counters,       │     │
+│  │   recording_ref, status }                               │     │
+│  └────────────────────────────────────────────────────────┘     │
+│                                                                  │
+│  Full role/ticket details remain in jit-server DB               │
+│  and are joined later using bundle_id for compliance.           │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Summary
+
+| Component | Role | Key Responsibility |
+|-----------|------|-------------------|
+| **jit-ui** | Web interface | User access requests |
+| **jit-server** | Control plane | Authorization, SCIM, state machine |
+| **cred-service** | Credential provider | Runtime TGT/tokens |
+| **jit-proxy** | Data plane | Proxy, record, report |
+| **pamjit** | Local agent | TLS prelude, byte forwarding |
+
+**Key Design Principles:**
+- jit-server is the **only** source of truth for grants
+- jit-proxy is **stateless** (queries jit-server per connection)
+- Database clients remain **unmodified**
+- All sessions are **recorded** for compliance
+- `bundle_id` enables accurate **attribution** of sessions to grants
