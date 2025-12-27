@@ -41,7 +41,6 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 | **JIT** | Just-In-Time (time-limited access) |
 | **JWT** | JSON Web Token |
 | **TLS** | Transport Layer Security |
-| **mTLS** | Mutual TLS (client and server certificates) |
 | **SCIM** | System for Cross-domain Identity Management |
 | **GSSAPI** | Generic Security Services API (Kerberos mechanism) |
 | **TGT** | Ticket-Granting Ticket (Kerberos credential) |
@@ -298,7 +297,7 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 ### Transport
 
-- TLS over TCP (server-auth minimum)
+- TLS over TCP (server-auth only). pamjit does not present a client certificate; user identity is carried by the prelude JWT.
 - jit-proxy requires TLS from byte 0
 - Prelude is sent **once** per pamjit→jit-proxy TCP connection, before any DB bytes
 - After authorization succeeds, jit-proxy switches to streaming mode (DB wire protocol only)
@@ -798,14 +797,12 @@ To detect tampering, jit-proxy computes a checksum on recording close:
 
 | Path | Security |
 |------|----------|
-| pamjit → jit-proxy | TLS (server-auth minimum; mTLS optional) |
+| pamjit → jit-proxy | TLS (server-auth only) + end-user JWT in prelude |
 | jit-proxy → jit-server | HTTPS + service JWT |
 | jit-proxy → cred-service | HTTPS + service JWT |
 | jit-proxy → Database | TLS + GSSAPI/SASL |
 
-**mTLS option (pamjit → jit-proxy)**: For stronger workstation identity, deployments may require mTLS with client certificates pinned to device identity. This is optional; server-auth TLS with JWT-based user identity in prelude is the default.
-
-**Certificate trust (pamjit)**: pamjit should use a pinned intermediate CA or explicit trust store for jit-proxy verification, rather than relying on system CA store. This prevents MITM via rogue CA.
+**Certificate trust (pamjit)**: pamjit MUST verify the jit-proxy server certificate (hostname + chain) and SHOULD use a pinned CA bundle or explicit trust store (deployment-specific) instead of the OS trust store.
 
 ### Rate Limiting
 
