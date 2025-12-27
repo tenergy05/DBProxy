@@ -95,6 +95,62 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 
 > One principal per TGT is sufficient; database roles are managed via SCIM on the Directory/IAM side.
 
+#### cred-service API
+
+**Purpose**: cred-service issues short-lived database credentials (e.g., Kerberos ccache) only after validating a request from an authorized jit-proxy instance.
+
+**POST `/api/v1/credentials/fetch`**
+
+**Headers**:
+```
+Authorization: Bearer <service_jwt>   # jit-proxy service identity
+```
+
+**Body**:
+```json
+{
+  "db_session_id": "uuid",
+  "session_token": "opaque-single-use-token",
+  "asset_uid": "asset-uuid",
+  "db_type": "cockroachdb",
+  "target_host": "db.example.com",
+  "target_port": 26257,
+  "requested_at": "2025-12-30T10:00:00Z"
+}
+```
+
+**Response (Success)**:
+```json
+{
+  "format": "krb5_ccache",
+  "ttl_seconds": 900,
+  "ccache": {
+    "mode": "bytes",
+    "b64": "base64-encoded-ccache..."
+  }
+}
+```
+
+**Response (file mode alternative)**:
+```json
+{
+  "format": "krb5_ccache",
+  "ttl_seconds": 900,
+  "ccache": {
+    "mode": "path",
+    "path": "/var/run/krb5cc/session-uuid"
+  }
+}
+```
+
+**Authorization flow**:
+1. cred-service validates `service_jwt` (jit-proxy identity)
+2. cred-service calls jit-server to validate `session_token` is valid and matches `(asset_uid, db_type, target_host, target_port)`
+3. On success, cred-service generates/retrieves credentials for the target database
+4. `session_token` is **not consumed** by cred-service (only by `/sessions/start`)
+
+> **Security**: cred-service MUST validate session_token with jit-server before issuing credentials. This prevents a compromised jit-proxy from requesting credentials for arbitrary assets.
+
 ### jit-proxy (Data Plane)
 
 **Role**: Database proxy with recording
