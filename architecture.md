@@ -69,7 +69,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Calls jit-server HTTPS endpoints
 - Displays approval results and grant identifiers
 
-> **Note**: Host/port is supplied by the user to pamjit (or read from local config). jit-server validates `(asset_uid, host, port)` against allowlists/patterns and **blocks link-local, localhost, and reserved ranges** as appropriate.
+> **Note**: Host/port is supplied by the user to pamjit (or read from local config). jit-server enforces **network policy**: blocks loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`), unspecified, and multicast; enforces allowed port sets per `db_type`; optionally validates per-asset host allowlists if configured. Private range policy (`10/8`, `172.16/12`, `192.168/16`) is deployment-specific.
 
 ### jit-server (Control Plane)
 
@@ -88,7 +88,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Provides Kerberos TGT/credential cache for database auth
 - Returns tokens/credentials based on database type
 - **Only called by jit-proxy** - no other component accesses cred-service directly
-- jit-proxy authenticates to cred-service via mTLS or service token
+- jit-proxy authenticates to cred-service via service JWT
 
 **Credential response options**:
 - Path to a credential cache file mounted/accessible on jit-proxy, or
@@ -101,14 +101,15 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 **Role**: Database proxy with recording
 
 - Accepts TLS connections from pamjit
-- Validates prelude (JWT, asset, anti-replay)
-- Authorizes via jit-server (service auth + user JWT as subject-of-request)
+- Performs lightweight prelude validation (framing, JSON schema, size limits, ts window)
+- Forwards to jit-server for authoritative JWT validation + anti-replay + authorization
 - Fetches credentials from cred-service
 - Connects to backend database (TLS + GSSAPI)
 - Records all queries/commands to JSONL
 - Reports session lifecycle to jit-server
+- **Stateful per connection**: prepared statement maps, cancel key mapping, recording file handles, protocol state
 
-> **Auth pattern**: jit-proxy authenticates to jit-server using mTLS or service token, while passing the user's JWT as the subject-of-request for authorization decisions.
+> **Auth pattern**: jit-proxy authenticates to jit-server using service JWT, passing the user's JWT via `X-End-User-JWT` header. jit-proxy does not interpret the user JWT beyond basic size limits.
 
 ### pamjit (Local Agent)
 
@@ -299,6 +300,7 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────────┬────────────────────────────────────────────┐  │
 │  │ uint32 len  │              JSON payload                   │  │
+│  │ (big-endian)│              (UTF-8)                        │  │
 │  └─────────────┴────────────────────────────────────────────┘  │
 │                                                                 │
 │  Payload Fields:                                                │
@@ -316,24 +318,40 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**Wire format rules**:
+- Length prefix: big-endian uint32
+- Max payload size: 64 KB
+- Encoding: UTF-8
+- On parse failure: close connection immediately
+
+**JWT forwarding**: jit-proxy forwards `prelude.jwt` **verbatim** to jit-server in `X-End-User-JWT` header. jit-proxy does not re-mint, transform, or interpret the JWT beyond size limits.
+
 ### Anti-Replay Protection
 
-| Field | Purpose | Storage |
-|-------|---------|---------|
-| `ts` | Timestamp within 120s window | jit-proxy validates (lightweight) |
-| `nonce` | Unique per request | **jit-server** TTL cache (2-5 min) |
+| Field | Purpose | Validation |
+|-------|---------|------------|
+| `ts` | Timestamp freshness | jit-proxy: sanity check; **jit-server: authoritative** |
+| `nonce` | Unique per request | **jit-server** shared TTL store (2-5 min) |
 
-- **jit-proxy**: performs lightweight checks (ts window, JSON schema)
-- **jit-server**: enforces anti-replay (authoritative nonce cache in CockroachDB or Redis)
-- jit-proxy may keep a small local nonce cache as optimization only
+**Validation split**:
+- **jit-proxy**: lightweight ts sanity (drop obviously stale/future timestamps, e.g., >5 min skew); best-effort local nonce cache using `sha256(raw_jwt + asset_uid + nonce)` as key
+- **jit-server**: authoritative ts window check (rejects `ts_epoch_ms` outside ±120s even if nonce is new) + authoritative nonce uniqueness via shared TTL store (**recommended: Redis**). CockroachDB can be used with unique constraint + TTL cleanup, but is not preferred due to write load/latency.
 
-**Nonce cache key**: `hash(jwt_sub + asset_uid + nonce)` — prevents replay across users/assets.
+**Nonce cache key** (jit-server): `hash(jwt_sub + asset_uid + nonce)` — computed after JWT validation, prevents replay across users/assets.
 
 ---
 
 ## jit-server API
 
 All endpoints use **POST** (authorization decisions with request context).
+
+### Service JWT Requirements
+
+jit-proxy authenticates to jit-server using a service JWT with:
+- **Short TTL** (e.g., 5-15 minutes, auto-refreshed)
+- **Audience** (`aud`) bound to jit-server
+- **Scopes/claims** restricting access to specific endpoints (`db:authorize`, `db:sessions`)
+- **Rate limits** enforced per service identity
 
 ### POST `/api/v1/db/connect/authorize`
 
@@ -382,9 +400,13 @@ X-End-User-JWT: <user_jwt>                # end-user identity (validated by jit-
 
 Called by jit-proxy when DB connection is established.
 
+**Headers**: `Authorization: Bearer <service_jwt>` only (no end-user JWT required; session is correlated by `bundle_id` + `db_session_id`).
+
 ### POST `/api/v1/db/sessions/end`
 
 Called by jit-proxy when DB session terminates (includes summary).
+
+**Headers**: `Authorization: Bearer <service_jwt>` only.
 
 ---
 
@@ -488,6 +510,8 @@ For Cassandra and MongoDB, early implementation phases may use **pass-through + 
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**Concurrency model**: Each EventLoop handles **many concurrent channels** (client + backend sockets). There is not one thread per connection. Concurrency is limited by CPU, memory, kernel socket limits, and blocking executor saturation.
+
 ### Non-Blocking Rule
 
 **Never block the EventLoop thread:**
@@ -498,6 +522,10 @@ For Cassandra and MongoDB, early implementation phases may use **pass-through + 
 ### Connection Pending State
 
 Authorization (jit-server) and credential fetch (cred-service) **must complete before** jit-proxy starts forwarding DB bytes. The connection remains in a "pending" state during this phase. If these calls take seconds to minutes, the client will wait—this is expected behavior.
+
+### Blocking Executor Limits
+
+Blocking executor is **bounded** with concurrency limits and timeouts. If saturated, new connections remain pending or are rejected with a "server busy" error.
 
 ---
 
@@ -538,7 +566,8 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 - Recordings are written as local JSONL files on jit-proxy during the session
 - On session end, recordings may be uploaded to object storage (S3, GCS, etc.)
 - `recording_ref` can be a local path or object storage key; jit-server treats it as opaque
-- **jit-server stores only session metadata + `recording_ref`**; it forwards (or triggers forwarding) to post-activity-review server on session end
+- **jit-server stores only session metadata + `recording_ref`**
+- Integration with post-activity-review: jit-server **pushes** session summary (or review-server pulls on schedule); actual recording retrieval uses `recording_ref`
 - Retention and cleanup policies are deployment-specific
 
 ---
@@ -565,7 +594,7 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 │  │                   │  jit-proxy  │                        │    │
 │  │                   └──────┬──────┘                        │    │
 │  └──────────────────────────┼──────────────────────────────┘    │
-│                             │ mTLS / Service Token               │
+│                             │ HTTPS + Service JWT                 │
 │  ═══════════════════════════════════════════════════════════    │
 │                             │                                    │
 │  ┌──────────────────────────▼──────────────────────────────┐    │
@@ -584,8 +613,8 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 | Path | Security |
 |------|----------|
 | pamjit → jit-proxy | TLS (server-auth minimum) |
-| jit-proxy → jit-server | HTTPS (mTLS or service token) |
-| jit-proxy → cred-service | HTTPS (mTLS or service token) |
+| jit-proxy → jit-server | HTTPS + service JWT |
+| jit-proxy → cred-service | HTTPS + service JWT |
 | jit-proxy → Database | TLS + GSSAPI/SASL |
 
 ### Target Validation
@@ -620,6 +649,8 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 **Default behavior**: Allow DB session to continue until client disconnects, even if `bundle_expires_at` passes mid-session. SCIM revocation will eventually reduce privileges at the database level.
 
 **Rationale**: Forcibly terminating active queries can cause data corruption or leave transactions in unknown state. The SCIM-based revocation provides eventual consistency.
+
+**Reporting**: jit-proxy always reports `expired_while_connected: true` in session summary if the session outlived `bundle_expires_at`. This enables compliance review.
 
 > **Alternative (stricter)**: jit-proxy can optionally enforce expiry by terminating sessions at `bundle_expires_at`. This requires explicit opt-in per deployment.
 
