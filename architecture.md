@@ -119,12 +119,16 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Sends authentication prelude
 - Forwards bytes bidirectionally (protocol-agnostic)
 
+> pamjit never inspects, modifies, or interprets database protocol bytes; it operates strictly as a byte-forwarding transport after authorization.
+
 ### Protocol: Client ↔ pamjit
 
 - Client connects to `127.0.0.1:<local_port>` (plain TCP, no TLS)
 - pamjit does **not** parse database protocol; it only forwards bytes after jit-proxy approves
 - While authorization is pending, pamjit holds the client socket open but does not forward bytes until it receives OK from jit-proxy
 - If authorization fails, pamjit closes the client connection immediately
+
+> **No retry**: pamjit MUST NOT retry authorization or resend a prelude on failure; each database connection attempt results in exactly one prelude and one CONNECT_DECISION. This avoids accidental replay amplification.
 
 ---
 
@@ -255,7 +259,8 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
      │             │             │ 9. TLS + GSSAPI Connect     │              │
      │             │             ├─────────────────────────────────────────────▶
      │             │             │              │              │              │
-     │             │ 10. ACK     │              │              │              │
+     │             │ 10. CONNECT │              │              │              │
+     │             │  _DECISION  │              │              │              │
      │             │◀────────────┤              │              │              │
      │             │             │              │              │              │
      │ 11. Ready   │             │              │              │              │
@@ -371,7 +376,9 @@ Both `X-End-User-JWT` and `Authorization: Bearer <service_jwt>` headers contain 
 
 **Validation split**:
 - **jit-proxy**: lightweight ts sanity (drop obviously stale/future timestamps, e.g., >120s skew); best-effort local nonce cache using `sha256(raw_jwt + asset_uid + nonce)` as key
-- **jit-server**: authoritative ts window check (rejects `ts_epoch_ms` outside ±120s even if nonce is new) + authoritative nonce uniqueness via shared TTL store (**recommended: Redis**). CockroachDB can be used with unique constraint + TTL cleanup, but is not preferred due to write load/latency.
+- **jit-server**: authoritative ts window check (rejects `ts_epoch_ms` outside ±120s even if nonce is new) + authoritative nonce uniqueness via shared TTL store (**recommended: Redis**).
+
+> **Why Redis over CockroachDB?** Redis is recommended due to lower write amplification and sub-millisecond latency for high-rate nonce checks. CockroachDB can be used with TTL rows and unique constraints, but is not preferred for this workload.
 
 > **Window consistency**: Both jit-proxy sanity check and jit-server authoritative check use ±120s. Total prelude→ready timeout (30s) is well under this window.
 
@@ -513,6 +520,8 @@ Called by jit-proxy when DB connection is established.
 > **`db_type` trust**: jit-proxy MUST set `db_type` from the `/authorize` response, not from prelude or local config.
 
 **Response**: `200 OK` with empty body, or `4xx` on validation failure (invalid/expired `session_token`).
+
+> **Token consumption**: On successful `/sessions/start`, `session_token` is atomically consumed and cannot be reused.
 
 ### POST `/api/v1/db/sessions/end`
 
