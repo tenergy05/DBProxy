@@ -69,7 +69,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Calls jit-server HTTPS endpoints
 - Displays approval results and grant identifiers
 
-> **Note**: Host/port is supplied by the user to pamjit (or read from local config). jit-server does not require host/port for authorization but may optionally validate against asset metadata if available.
+> **Note**: Host/port is supplied by the user to pamjit (or read from local config). jit-server validates `(asset_uid, host, port)` against allowlists/patterns and **blocks link-local, localhost, and reserved ranges** as appropriate.
 
 ### jit-server (Control Plane)
 
@@ -320,8 +320,12 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 | Field | Purpose | Storage |
 |-------|---------|---------|
-| `ts` | Timestamp within 120s window | Not stored |
-| `nonce` | Unique per request | jit-proxy in-memory TTL cache (~120s) |
+| `ts` | Timestamp within 120s window | jit-proxy validates (lightweight) |
+| `nonce` | Unique per request | **jit-server** TTL cache (2-5 min) |
+
+- **jit-proxy**: performs lightweight checks (ts window, JSON schema)
+- **jit-server**: enforces anti-replay (authoritative nonce cache in CockroachDB or Redis)
+- jit-proxy may keep a small local nonce cache as optimization only
 
 **Nonce cache key**: `hash(jwt_sub + asset_uid + nonce)` — prevents replay across users/assets.
 
@@ -335,9 +339,15 @@ All endpoints use **POST** (authorization decisions with request context).
 
 Called by jit-proxy to authorize a new connection.
 
+**Headers**:
+```
+Authorization: Bearer <service_jwt>       # jit-proxy service identity
+X-End-User-JWT: <user_jwt>                # end-user identity (validated by jit-server)
+```
+
+**Body**:
 ```json
 {
-  "user_id": "derived-from-jwt-sub",
   "asset_uid": "asset-uuid",
   "target_host": "db.example.com",
   "target_port": 26257,
@@ -346,7 +356,7 @@ Called by jit-proxy to authorize a new connection.
 }
 ```
 
-> **Note**: `target_host` and `target_port` are forwarded for audit/validation. jit-server may validate against asset metadata if available, or apply port allowlists by db_type.
+> **Note**: User identity is derived from `X-End-User-JWT`, not from the request body. jit-server validates the end-user JWT and extracts claims.
 
 **Response (Success)**
 
@@ -402,6 +412,8 @@ Called by jit-proxy when DB session terminates (includes summary).
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+> **Security**: jit-proxy **MUST NOT** trust prelude for `db_type`. Engine selection is based solely on the `db_type` returned by jit-server in the authorize response.
 
 ### Postgres/CockroachDB Engine
 
@@ -479,9 +491,9 @@ For Cassandra and MongoDB, early implementation phases may use **pass-through + 
 ### Non-Blocking Rule
 
 **Never block the EventLoop thread:**
-- HTTPS calls must be async or offloaded
+- HTTPS calls to jit-server and cred-service **must be asynchronous** (or offloaded to a dedicated executor)
+- Results must be marshaled back to the channel's EventLoop
 - GSSAPI token generation offloaded if slow
-- Results written back on EventLoop
 
 ### Connection Pending State
 
@@ -526,6 +538,7 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 - Recordings are written as local JSONL files on jit-proxy during the session
 - On session end, recordings may be uploaded to object storage (S3, GCS, etc.)
 - `recording_ref` can be a local path or object storage key; jit-server treats it as opaque
+- **jit-server stores only session metadata + `recording_ref`**; it forwards (or triggers forwarding) to post-activity-review server on session end
 - Retention and cleanup policies are deployment-specific
 
 ---
@@ -640,7 +653,7 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 
 **Key Design Principles:**
 - jit-server is the **only** source of truth for grants
-- jit-proxy is **stateless for authorization** (queries jit-server per connection, does not store long-lived grant state; maintains per-connection state for recording/prepared statements/nonce cache)
+- jit-proxy is **stateless for grant authority** (does not persist approvals/grants; queries jit-server per connection); **stateful per connection** for protocol parsing, prepared statement maps, cancel key mapping, and recording
 - Database clients remain **unmodified**
 - All sessions are **recorded** for compliance
 - `bundle_id` enables accurate **attribution** of sessions to grants
