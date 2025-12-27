@@ -326,6 +326,19 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 **JWT forwarding**: jit-proxy forwards `prelude.jwt` **verbatim** to jit-server in `X-End-User-JWT` header. jit-proxy does not re-mint, transform, or interpret the JWT beyond size limits.
 
+### JWT Redaction Rules
+
+The `X-End-User-JWT` header contains sensitive credentials and **must be treated as secret**:
+
+| Context | Rule |
+|---------|------|
+| HTTP access logs | **Redact** (omit or mask entirely) |
+| Application logs | **Redact** |
+| Metrics/traces | **Never emit** |
+| Debugging | Allowed: hashed fingerprint only, e.g., `sha256(jwt)[:16]` |
+
+> **Rationale**: JWT leakage enables session hijacking. Fingerprints allow correlation without exposing the token.
+
 ### Anti-Replay Protection
 
 | Field | Purpose | Validation |
@@ -338,6 +351,49 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 - **jit-server**: authoritative ts window check (rejects `ts_epoch_ms` outside ±120s even if nonce is new) + authoritative nonce uniqueness via shared TTL store (**recommended: Redis**). CockroachDB can be used with unique constraint + TTL cleanup, but is not preferred due to write load/latency.
 
 **Nonce cache key** (jit-server): `hash(jwt_sub + asset_uid + nonce)` — computed after JWT validation, prevents replay across users/assets.
+
+### Nonce Format
+
+- **Encoding**: base64url (RFC 4648 URL-safe, no padding required)
+- **Decoded length**: 16–32 bytes required
+- **Validation**: reject on decode failure or length mismatch
+
+### CONNECT_DECISION Frame (jit-proxy → pamjit)
+
+After prelude processing, jit-proxy sends **exactly one** decision frame before any DB bytes are forwarded. This allows pamjit to distinguish authorization outcomes from connection failures.
+
+**Wire format**: Same as prelude (big-endian uint32 length + UTF-8 JSON payload).
+
+```json
+{
+  "allowed": true,
+  "db_session_id": "uuid",
+  "bundle_id": "sha256-hash",
+  "bundle_expires_at": "2025-12-30T12:00:00Z"
+}
+```
+
+**Denied/Error response**:
+
+```json
+{
+  "allowed": false,
+  "reason": "no_active_grants"
+}
+```
+
+**Reason enum** (when `allowed: false`):
+- `no_active_grants` — user has no valid grants for asset
+- `authorize_denied` — jit-server rejected (policy, entitlement)
+- `authorize_timeout` — jit-server call timed out
+- `cred_failed` — cred-service call failed
+- `db_connect_failed` — backend DB connection failed
+- `db_auth_failed` — backend DB auth (GSSAPI/SASL) failed
+- `server_busy` — jit-proxy overloaded (backpressure)
+- `invalid_prelude` — prelude parse/validation error
+- `replay_detected` — ts/nonce replay rejected
+
+> **Protocol note**: pamjit MUST wait for this frame before forwarding any client bytes. If the socket closes before receiving CONNECT_DECISION, pamjit should treat it as an internal error.
 
 ---
 
@@ -383,9 +439,12 @@ X-End-User-JWT: <user_jwt>                # end-user identity (validated by jit-
   "allowed": true,
   "bundle_id": "sha256-hash-of-sorted-activity-uids",
   "bundle_expires_at": "2025-12-30T12:00:00Z",
-  "db_type": "cockroachdb"
+  "db_type": "cockroachdb",
+  "session_token": "opaque-single-use-token"
 }
 ```
+
+> **`session_token`**: Opaque, single-use token (short TTL, e.g., 60s). Required on `/sessions/start` to bind session lifecycle to authorize decision. Prevents a compromised proxy from minting fake sessions.
 
 **Response (Denied)**
 
@@ -400,13 +459,58 @@ X-End-User-JWT: <user_jwt>                # end-user identity (validated by jit-
 
 Called by jit-proxy when DB connection is established.
 
-**Headers**: `Authorization: Bearer <service_jwt>` only (no end-user JWT required; session is correlated by `bundle_id` + `db_session_id`).
+**Headers**: `Authorization: Bearer <service_jwt>` only (no end-user JWT required; session is bound by `session_token`).
+
+**Body**:
+```json
+{
+  "session_token": "opaque-single-use-token",
+  "db_session_id": "uuid",
+  "asset_uid": "asset-uuid",
+  "db_type": "cockroachdb",
+  "target_host": "db.example.com",
+  "target_port": 26257,
+  "proxy_instance_id": "proxy-pod-xyz",
+  "client_addr": "10.1.2.3:54321",
+  "start_time": "2025-12-30T10:00:00Z"
+}
+```
+
+**Response**: `200 OK` with empty body, or `4xx` on validation failure (invalid/expired `session_token`).
 
 ### POST `/api/v1/db/sessions/end`
 
 Called by jit-proxy when DB session terminates (includes summary).
 
 **Headers**: `Authorization: Bearer <service_jwt>` only.
+
+**Body**:
+```json
+{
+  "db_session_id": "uuid",
+  "bundle_id": "sha256-hash",
+  "bundle_expires_at": "2025-12-30T12:00:00Z",
+  "start_time": "2025-12-30T10:00:00Z",
+  "end_time": "2025-12-30T10:05:00Z",
+  "expired_while_connected": false,
+  "status": "COMPLETED",
+  "termination_reason": "CLIENT_CLOSE",
+  "query_count": 42,
+  "error_count": 0,
+  "bytes_up": 12345,
+  "bytes_down": 67890,
+  "recording_ref": "s3://bucket/recordings/uuid.jsonl"
+}
+```
+
+**Enums**:
+
+| Field | Values |
+|-------|--------|
+| `status` | `COMPLETED`, `ABORTED`, `FAILED` |
+| `termination_reason` | `CLIENT_CLOSE`, `AUTHORIZE_DENY`, `AUTHORIZE_TIMEOUT`, `CRED_FAILED`, `DB_AUTH_FAILED`, `DB_CONN_FAILED`, `PROTOCOL_ERROR`, `INTERNAL_ERROR`, `SERVER_BUSY` |
+
+> **Note**: `ABORTED` = session started but ended abnormally (DB error, timeout). `FAILED` = session never fully established (auth/connect failure).
 
 ---
 
@@ -521,11 +625,34 @@ For Cassandra and MongoDB, early implementation phases may use **pass-through + 
 
 ### Connection Pending State
 
-Authorization (jit-server) and credential fetch (cred-service) **must complete before** jit-proxy starts forwarding DB bytes. The connection remains in a "pending" state during this phase. If these calls take seconds to minutes, the client will wait—this is expected behavior.
+Authorization (jit-server) and credential fetch (cred-service) **must complete before** jit-proxy starts forwarding DB bytes. The connection remains in a "pending" state during this phase, bounded by the total prelude→ready timeout (see Timeouts section).
 
 ### Blocking Executor Limits
 
 Blocking executor is **bounded** with concurrency limits and timeouts. If saturated, new connections remain pending or are rejected with a "server busy" error.
+
+### Timeouts
+
+| Operation | Timeout | On Timeout |
+|-----------|---------|------------|
+| jit-server `/authorize` | 10s | `authorize_timeout` |
+| cred-service credential fetch | 10s | `cred_failed` |
+| Backend DB TCP connect | 10s | `db_connect_failed` |
+| Backend DB auth (GSSAPI/SASL) | 15s | `db_auth_failed` |
+| **Total prelude→ready** | 30s | First applicable reason |
+
+> **Consistency note**: Total prelude→ready timeout (30s) is well under the ±120s anti-replay window. This ensures `ts_epoch_ms` remains valid throughout authorization without requiring re-authorization with fresh ts/nonce.
+
+### Backpressure & Limits
+
+| Condition | Action |
+|-----------|--------|
+| Blocking executor queue full | Reject with `server_busy` |
+| Pending connections > N | Reject with `server_busy` |
+| EventLoop latency > threshold | Shed load (reject new accepts) |
+| HTTP client pool exhausted | Reject with `server_busy` |
+
+> **Tuning**: Exact thresholds (N, latency threshold) are deployment-specific. Monitor p99 latency and queue depths to set appropriate values.
 
 ---
 
