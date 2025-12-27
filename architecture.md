@@ -90,17 +90,25 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - **Only called by jit-proxy** - no other component accesses cred-service directly
 - jit-proxy authenticates to cred-service via mTLS or service token
 
+**Credential response options**:
+- Path to a credential cache file mounted/accessible on jit-proxy, or
+- Byte blob + format + TTL; jit-proxy writes to temp ccache file
+
+> One principal per TGT is sufficient; database roles are managed via SCIM on the Directory/IAM side.
+
 ### jit-proxy (Data Plane)
 
 **Role**: Database proxy with recording
 
 - Accepts TLS connections from pamjit
 - Validates prelude (JWT, asset, anti-replay)
-- Authorizes via jit-server
+- Authorizes via jit-server (service auth + user JWT as subject-of-request)
 - Fetches credentials from cred-service
 - Connects to backend database (TLS + GSSAPI)
 - Records all queries/commands to JSONL
 - Reports session lifecycle to jit-server
+
+> **Auth pattern**: jit-proxy authenticates to jit-server using mTLS or service token, while passing the user's JWT as the subject-of-request for authorization decisions.
 
 ### pamjit (Local Agent)
 
@@ -110,6 +118,13 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Opens TLS connection to jit-proxy
 - Sends authentication prelude
 - Forwards bytes bidirectionally (protocol-agnostic)
+
+### Protocol: Client ↔ pamjit
+
+- Client connects to `127.0.0.1:<local_port>` (plain TCP, no TLS)
+- pamjit does **not** parse database protocol; it only forwards bytes after jit-proxy approves
+- While authorization is pending, pamjit holds the client socket open but does not forward bytes until it receives OK from jit-proxy
+- If authorization fails, pamjit closes the client connection immediately
 
 ---
 
@@ -306,7 +321,9 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 | Field | Purpose | Storage |
 |-------|---------|---------|
 | `ts` | Timestamp within 120s window | Not stored |
-| `nonce` | Unique per request | TTL cache (~120s) |
+| `nonce` | Unique per request | jit-proxy in-memory TTL cache (~120s) |
+
+**Nonce cache key**: `hash(jwt_sub + asset_uid + nonce)` — prevents replay across users/assets.
 
 ---
 
@@ -410,6 +427,10 @@ Called by jit-proxy when DB session terminates (includes summary).
 | Audit | Command names, collections (not full documents) |
 | Auth | TLS + SCRAM/Kerberos/IAM (deployment-dependent) |
 
+### Early Phase: Pass-Through Mode
+
+For Cassandra and MongoDB, early implementation phases may use **pass-through + minimal metadata logging** (connection events, byte counts) before upgrading to **structured command logging** with full protocol parsing.
+
 ---
 
 ## jit-proxy Netty Architecture
@@ -464,7 +485,7 @@ Called by jit-proxy when DB session terminates (includes summary).
 
 ### Connection Pending State
 
-Authorization (jit-server) and credential fetch (cred-service) **must complete before** jit-proxy starts forwarding DB bytes. The connection remains in a "pending" state during this phase. If these calls take 1-2 seconds, the client will wait—this is expected behavior.
+Authorization (jit-server) and credential fetch (cred-service) **must complete before** jit-proxy starts forwarding DB bytes. The connection remains in a "pending" state during this phase. If these calls take seconds to minutes, the client will wait—this is expected behavior.
 
 ---
 
@@ -487,14 +508,18 @@ Authorization (jit-server) and credential fetch (cred-service) **must complete b
 {
   "db_session_id": "uuid",
   "bundle_id": "hash",
+  "bundle_expires_at": "2025-12-30T12:00:00Z",
   "start_time": "2025-12-30T10:00:00Z",
   "end_time": "2025-12-30T10:00:05Z",
+  "expired_while_connected": false,
   "status": "COMPLETED",
   "query_count": 2,
   "error_count": 0,
   "recording_ref": "s3://bucket/recordings/uuid.jsonl"
 }
 ```
+
+> `expired_while_connected`: true if `end_time > bundle_expires_at`. Aids compliance review.
 
 ### Recording Storage
 
