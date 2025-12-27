@@ -10,8 +10,8 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │   ┌──────────┐  HTTPS  ┌──────────────┐  SCIM/HTTPS  ┌──────────────┐       │
-│   │  jit-ui  │────────▶│  jit-server  │─────────────▶│ DB Control   │       │
-│   │  (Web)   │         │ (Control)    │ grant/revoke │ Planes       │       │
+│   │  jit-ui  │────────▶│  jit-server  │─────────────▶│  Directory   │       │
+│   │  (Web)   │         │ (Control)    │ grant/revoke │  / IAM       │       │
 │   └──────────┘         └──────▲───────┘              └──────────────┘       │
 │                               │                                              │
 │                               │ HTTPS (authorize, session lifecycle)         │
@@ -53,7 +53,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 
 1. **Zero client modification** - Database clients remain unchanged
 2. **Centralized authorization** - jit-server is the single source of truth
-3. **Complete audit trail** - All queries/commands recorded per session
+3. **Audit trail** - Full query logging for Postgres/CockroachDB; command-level audit for Cassandra/MongoDB per engine maturity
 4. **Time-bounded access** - Grants expire automatically via SCIM
 5. **Multi-protocol support** - Postgres, Cassandra, MongoDB
 
@@ -65,9 +65,11 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 
 **Role**: User-facing portal for access requests
 
-- Collects asset selection, host/port, duration, ticket, roles
+- Collects asset selection, duration, ticket, roles
 - Calls jit-server HTTPS endpoints
 - Displays approval results and grant identifiers
+
+> **Note**: Host/port is supplied by the user to pamjit (or read from local config). jit-server does not require host/port for authorization but may optionally validate against asset metadata if available.
 
 ### jit-server (Control Plane)
 
@@ -75,7 +77,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 
 - Validates JWT identity
 - Validates entitlements and ticket rules
-- Connects to database control planes via SCIM (HTTPS) to grant/revoke roles
+- Connects to Directory / IAM via SCIM (HTTPS) to grant/revoke roles
 - Stores authoritative approval state in CockroachDB
 - Computes `bundle_id` for session attribution
 
@@ -150,6 +152,8 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 
 A user may have multiple concurrent grants for the same asset (multiple roles approved at different times). At DB session start, effective privileges are the **union** of all active grants. `bundle_id` labels that union for accurate post-activity attribution.
 
+> **Important**: `bundle_id` is computed from the active `activityUID` set at authorization time. It is **not a credential** and is not used for authorization—it is purely an attribution label for reporting and compliance.
+
 ---
 
 ## End-to-End Workflow
@@ -158,8 +162,8 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 ```
 ┌──────────┐     ┌──────────┐     ┌─────────────┐     ┌────────────┐
-│   User   │     │  jit-ui  │     │ jit-server  │     │DB Control  │
-│          │     │          │     │             │     │  Planes    │
+│   User   │     │  jit-ui  │     │ jit-server  │     │ Directory  │
+│          │     │          │     │             │     │   / IAM    │
 └────┬─────┘     └────┬─────┘     └──────┬──────┘     └─────┬──────┘
      │                │                   │                  │
      │ 1. Request     │                   │                  │
@@ -268,6 +272,9 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 - TLS over TCP (server-auth minimum)
 - jit-proxy requires TLS from byte 0
+- Prelude is sent **once** per pamjit→jit-proxy TCP connection, before any DB bytes
+- After authorization succeeds, jit-proxy switches to streaming mode (DB wire protocol only)
+- **If prelude validation fails, jit-proxy closes immediately and never forwards any client DB bytes**
 
 ### Message Format
 
@@ -303,9 +310,13 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 ---
 
-## Authorization API (jit-server)
+## jit-server API
 
-### Request: POST `/api/v1/db/connect/authorize`
+All endpoints use **POST** (authorization decisions with request context).
+
+### POST `/api/v1/db/connect/authorize`
+
+Called by jit-proxy to authorize a new connection.
 
 ```json
 {
@@ -318,18 +329,20 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 }
 ```
 
-### Response (Success)
+> **Note**: `target_host` and `target_port` are forwarded for audit/validation. jit-server may validate against asset metadata if available, or apply port allowlists by db_type.
+
+**Response (Success)**
 
 ```json
 {
   "allowed": true,
   "bundle_id": "sha256-hash-of-sorted-activity-uids",
-  "bundle_expires_at": "2024-11-01T12:00:00Z",
+  "bundle_expires_at": "2025-12-30T12:00:00Z",
   "db_type": "cockroachdb"
 }
 ```
 
-### Response (Denied)
+**Response (Denied)**
 
 ```json
 {
@@ -337,6 +350,14 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
   "reason": "no_active_grants"
 }
 ```
+
+### POST `/api/v1/db/sessions/start`
+
+Called by jit-proxy when DB connection is established.
+
+### POST `/api/v1/db/sessions/end`
+
+Called by jit-proxy when DB session terminates (includes summary).
 
 ---
 
@@ -358,8 +379,8 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 │         │                   │                   │                │
 │         ▼                   ▼                   ▼                │
 │  ┌─────────────┐     ┌─────────────┐     ┌─────────────┐        │
-│  │ TLS+GSSAPI  │     │ TLS+SASL/   │     │ TLS+SCRAM   │        │
-│  │ Auth        │     │ Kerberos    │     │ (optional)  │        │
+│  │ TLS+GSSAPI  │     │ TLS+SASL    │     │ TLS+SCRAM/  │        │
+│  │             │     │ (if enabled)│     │ Kerberos/IAM│        │
 │  └─────────────┘     └─────────────┘     └─────────────┘        │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -379,7 +400,7 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 |---------|----------------|
 | Framing | Native protocol v3-v6, modern segments |
 | Audit | QUERY/PREPARE CQL text, EXECUTE (requires prepared stmt mapping) |
-| Auth | TLS + SASL/Kerberos |
+| Auth | TLS + SASL/Kerberos (if enabled; some deployments use TLS-only) |
 
 ### MongoDB Engine
 
@@ -387,7 +408,7 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 |---------|----------------|
 | Framing | Length-prefixed BSON |
 | Audit | Command names, collections (not full documents) |
-| Auth | TLS + SCRAM (deployment-dependent) |
+| Auth | TLS + SCRAM/Kerberos/IAM (deployment-dependent) |
 
 ---
 
@@ -441,6 +462,10 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 - GSSAPI token generation offloaded if slow
 - Results written back on EventLoop
 
+### Connection Pending State
+
+Authorization (jit-server) and credential fetch (cred-service) **must complete before** jit-proxy starts forwarding DB bytes. The connection remains in a "pending" state during this phase. If these calls take 1-2 seconds, the client will wait—this is expected behavior.
+
 ---
 
 ## Session Recording
@@ -448,12 +473,12 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 ### Recording Format (JSONL)
 
 ```json
-{"ts":"2024-11-01T10:00:00Z","type":"SESSION_START","db_session_id":"uuid","bundle_id":"hash"}
-{"ts":"2024-11-01T10:00:01Z","type":"QUERY","text":"SELECT * FROM users WHERE id = $1"}
-{"ts":"2024-11-01T10:00:01Z","type":"RESULT","rows_affected":1}
-{"ts":"2024-11-01T10:00:02Z","type":"QUERY","text":"UPDATE users SET name = $1 WHERE id = $2"}
-{"ts":"2024-11-01T10:00:02Z","type":"RESULT","rows_affected":1}
-{"ts":"2024-11-01T10:00:05Z","type":"SESSION_END","queries":2,"errors":0}
+{"ts":"2025-12-30T10:00:00Z","type":"SESSION_START","db_session_id":"uuid","bundle_id":"hash"}
+{"ts":"2025-12-30T10:00:01Z","type":"QUERY","text":"SELECT * FROM users WHERE id = $1"}
+{"ts":"2025-12-30T10:00:01Z","type":"RESULT","rows_affected":1}
+{"ts":"2025-12-30T10:00:02Z","type":"QUERY","text":"UPDATE users SET name = $1 WHERE id = $2"}
+{"ts":"2025-12-30T10:00:02Z","type":"RESULT","rows_affected":1}
+{"ts":"2025-12-30T10:00:05Z","type":"SESSION_END","queries":2,"errors":0}
 ```
 
 ### Session Summary (to jit-server)
@@ -462,14 +487,21 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 {
   "db_session_id": "uuid",
   "bundle_id": "hash",
-  "start_time": "2024-11-01T10:00:00Z",
-  "end_time": "2024-11-01T10:00:05Z",
+  "start_time": "2025-12-30T10:00:00Z",
+  "end_time": "2025-12-30T10:00:05Z",
   "status": "COMPLETED",
   "query_count": 2,
   "error_count": 0,
   "recording_ref": "s3://bucket/recordings/uuid.jsonl"
 }
 ```
+
+### Recording Storage
+
+- Recordings are written as local JSONL files on jit-proxy during the session
+- On session end, recordings may be uploaded to object storage (S3, GCS, etc.)
+- `recording_ref` can be a local path or object storage key; jit-server treats it as opaque
+- Retention and cleanup policies are deployment-specific
 
 ---
 
@@ -538,13 +570,20 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 │  JWT validation fails       │ Reject prelude, close connection  │
 │  ts/nonce replay detected   │ Reject prelude, close connection  │
 │  jit-server authorize fails │ Reject before DB bytes forwarded  │
-│  cred-service fails          │ Reject, optionally report attempt │
+│  cred-service fails         │ Reject, optionally report attempt │
 │  DB connect/auth fails      │ Report session ABORTED, close     │
 │  DB protocol error          │ Log error, forward to client      │
-│  Session expires mid-flight │ Option: allow continue or close   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Session Expiry Policy
+
+**Default behavior**: Allow DB session to continue until client disconnects, even if `bundle_expires_at` passes mid-session. SCIM revocation will eventually reduce privileges at the database level.
+
+**Rationale**: Forcibly terminating active queries can cause data corruption or leave transactions in unknown state. The SCIM-based revocation provides eventual consistency.
+
+> **Alternative (stricter)**: jit-proxy can optionally enforce expiry by terminating sessions at `bundle_expires_at`. This requires explicit opt-in per deployment.
 
 ---
 
@@ -576,7 +615,7 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 **Key Design Principles:**
 - jit-server is the **only** source of truth for grants
-- jit-proxy is **stateless** (queries jit-server per connection)
+- jit-proxy is **stateless for authorization** (queries jit-server per connection, does not store long-lived grant state; maintains per-connection state for recording/prepared statements/nonce cache)
 - Database clients remain **unmodified**
 - All sessions are **recorded** for compliance
 - `bundle_id` enables accurate **attribution** of sessions to grants
