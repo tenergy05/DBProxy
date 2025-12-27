@@ -9,10 +9,10 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 │                           ARCHITECTURE OVERVIEW                              │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
-│   ┌──────────┐  HTTPS  ┌──────────────┐                                     │
-│   │  jit-ui  │────────▶│  jit-server  │                                     │
-│   │  (Web)   │         │ (Control)    │                                     │
-│   └──────────┘         └──────▲───────┘                                     │
+│   ┌──────────┐  HTTPS  ┌──────────────┐  SCIM/HTTPS  ┌──────────────┐       │
+│   │  jit-ui  │────────▶│  jit-server  │─────────────▶│ DB Control   │       │
+│   │  (Web)   │         │ (Control)    │ grant/revoke │ Planes       │       │
+│   └──────────┘         └──────▲───────┘              └──────────────┘       │
 │                               │                                              │
 │                               │ HTTPS (authorize, session lifecycle)         │
 │                               │                                              │
@@ -45,8 +45,6 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 | **SCIM** | System for Cross-domain Identity Management |
 | **GSSAPI** | Generic Security Services API (Kerberos mechanism) |
 | **TGT** | Ticket-Granting Ticket (Kerberos credential) |
-| **ALPN** | Application-Layer Protocol Negotiation |
-| **SNI** | Server Name Indication |
 | **RBAC** | Role-Based Access Control |
 
 ---
@@ -63,53 +61,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 
 ## Components
 
-### Component Diagram
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              CONTROL PLANE                                       │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │                           jit-server                                     │    │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │    │
-│  │  │ JWT Validation│ │  Entitlement │ │    SCIM      │ │   State      │   │    │
-│  │  │              │ │    Check     │ │  Grants/     │ │   Machine    │   │    │
-│  │  │              │ │              │ │  Revokes     │ │              │   │    │
-│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘   │    │
-│  │                              │                                          │    │
-│  │                              ▼                                          │    │
-│  │                    ┌──────────────────┐                                 │    │
-│  │                    │   CockroachDB    │                                 │    │
-│  │                    │  (Grant State)   │                                 │    │
-│  │                    └──────────────────┘                                 │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                               DATA PLANE                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │                            jit-proxy                                     │    │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐   │    │
-│  │  │   Prelude    │ │  Protocol    │ │   Session    │ │    Audit     │   │    │
-│  │  │  Validator   │ │   Engines    │ │   Recorder   │ │   Reporter   │   │    │
-│  │  │              │ │ (PG/C*/Mongo)│ │   (JSONL)    │ │              │   │    │
-│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘   │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              CLIENT SIDE                                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │                             pamjit                                       │    │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐                     │    │
-│  │  │   Localhost  │ │     TLS      │ │   Prelude    │                     │    │
-│  │  │   Listener   │ │   Connect    │ │    Sender    │                     │    │
-│  │  │              │ │              │ │              │                     │    │
-│  │  └──────────────┘ └──────────────┘ └──────────────┘                     │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 1. jit-ui (Web Interface)
+### jit-ui (Web Interface)
 
 **Role**: User-facing portal for access requests
 
@@ -117,17 +69,17 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Calls jit-server HTTPS endpoints
 - Displays approval results and grant identifiers
 
-### 2. jit-server (Control Plane)
+### jit-server (Control Plane)
 
 **Role**: Authorization hub and state machine
 
 - Validates JWT identity
 - Validates entitlements and ticket rules
-- Orchestrates SCIM grants/revocations
+- Connects to database control planes via SCIM (HTTPS) to grant/revoke roles
 - Stores authoritative approval state in CockroachDB
 - Computes `bundle_id` for session attribution
 
-### 3. cred-service (Credential Provider)
+### cred-service (Credential Provider)
 
 **Role**: Runtime credential distribution
 
@@ -136,7 +88,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - **Only called by jit-proxy** - no other component accesses cred-service directly
 - jit-proxy authenticates to cred-service via mTLS or service token
 
-### 4. jit-proxy (Data Plane)
+### jit-proxy (Data Plane)
 
 **Role**: Database proxy with recording
 
@@ -148,7 +100,7 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 - Records all queries/commands to JSONL
 - Reports session lifecycle to jit-server
 
-### 5. pamjit (Local Agent)
+### pamjit (Local Agent)
 
 **Role**: Client-side forwarder (tsh-like)
 
@@ -205,33 +157,34 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 ### Phase 1: Access Request (Control Plane)
 
 ```
-┌──────────┐     ┌──────────┐     ┌─────────────┐     ┌──────────┐
-│   User   │     │  jit-ui  │     │ jit-server  │     │   SCIM   │
-└────┬─────┘     └────┬─────┘     └──────┬──────┘     └────┬─────┘
-     │                │                   │                 │
-     │ 1. Request     │                   │                 │
-     │    Access      │                   │                 │
-     ├───────────────▶│                   │                 │
-     │                │                   │                 │
-     │                │ 2. POST /request  │                 │
-     │                ├──────────────────▶│                 │
-     │                │                   │                 │
-     │                │                   │ 3. Validate JWT │
-     │                │                   │    Entitlements │
-     │                │                   │    Ticket Rules │
-     │                │                   │                 │
-     │                │                   │ 4. Grant Role   │
-     │                │                   ├────────────────▶│
-     │                │                   │                 │
-     │                │                   │◀────────────────┤
-     │                │                   │                 │
-     │                │ 5. activityUID(s) │                 │
-     │                │◀──────────────────┤                 │
-     │                │                   │                 │
-     │ 6. Grant       │                   │                 │
-     │    Status      │                   │                 │
-     │◀───────────────┤                   │                 │
-     │                │                   │                 │
+┌──────────┐     ┌──────────┐     ┌─────────────┐     ┌────────────┐
+│   User   │     │  jit-ui  │     │ jit-server  │     │DB Control  │
+│          │     │          │     │             │     │  Planes    │
+└────┬─────┘     └────┬─────┘     └──────┬──────┘     └─────┬──────┘
+     │                │                   │                  │
+     │ 1. Request     │                   │                  │
+     │    Access      │                   │                  │
+     ├───────────────▶│                   │                  │
+     │                │                   │                  │
+     │                │ 2. POST /request  │                  │
+     │                ├──────────────────▶│                  │
+     │                │                   │                  │
+     │                │                   │ 3. Validate JWT  │
+     │                │                   │    Entitlements  │
+     │                │                   │    Ticket Rules  │
+     │                │                   │                  │
+     │                │                   │ 4. SCIM Grant    │
+     │                │                   ├─────────────────▶│
+     │                │                   │                  │
+     │                │                   │◀─────────────────┤
+     │                │                   │                  │
+     │                │ 5. activityUID(s) │                  │
+     │                │◀──────────────────┤                  │
+     │                │                   │                  │
+     │ 6. Grant       │                   │                  │
+     │    Status      │                   │                  │
+     │◀───────────────┤                   │                  │
+     │                │                   │                  │
 ```
 
 ### Phase 2: Database Connection (Data Plane)
@@ -350,7 +303,7 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 ---
 
-## jit-proxy Authorization API
+## Authorization API (jit-server)
 
 ### Request: POST `/api/v1/db/connect/authorize`
 
@@ -620,44 +573,6 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 12. Rate limiting
 13. Session expiry enforcement
 14. Postgres cancel request support
-
----
-
-## Data Flow Summary
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    MINIMAL DATA EXCHANGE                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  jit-server returns (authorization):                            │
-│  ┌────────────────────────────────────────────────────────┐     │
-│  │ { allowed, bundle_id, bundle_expires_at, db_type }     │     │
-│  └────────────────────────────────────────────────────────┘     │
-│                                                                  │
-│  jit-proxy sends (session lifecycle):                           │
-│  ┌────────────────────────────────────────────────────────┐     │
-│  │ { db_session_id, bundle_id, start/end, counters,       │     │
-│  │   recording_ref, status }                               │     │
-│  └────────────────────────────────────────────────────────┘     │
-│                                                                  │
-│  Full role/ticket details remain in jit-server DB               │
-│  and are joined later using bundle_id for compliance.           │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Summary
-
-| Component | Role | Key Responsibility |
-|-----------|------|-------------------|
-| **jit-ui** | Web interface | User access requests |
-| **jit-server** | Control plane | Authorization, SCIM, state machine |
-| **cred-service** | Credential provider | Runtime TGT/tokens |
-| **jit-proxy** | Data plane | Proxy, record, report |
-| **pamjit** | Local agent | TLS prelude, byte forwarding |
 
 **Key Design Principles:**
 - jit-server is the **only** source of truth for grants
