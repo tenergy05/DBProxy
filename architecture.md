@@ -162,13 +162,25 @@ This document describes a **Just-In-Time (JIT) database access system** with **s
 |------------|------------|---------|
 | `activityUID` | jit-server | Tracks individual grant request/approval |
 | `db_session_id` | jit-proxy | Identifies single TCP database connection |
-| `bundle_id` | jit-server | Labels session with set of active grants |
+| `bundle_id` | jit-server | Labels session with set of active grants (attribution/reporting) |
+| `session_token` | jit-server | Single-use token binding authorize → session lifecycle |
+
+**`db_session_id` generation**: jit-proxy generates `db_session_id` (UUID) immediately after successful prelude parse, before calling `/authorize`. This ID is included in the authorize request and returned in CONNECT_DECISION.
 
 ### Why bundle_id?
 
 A user may have multiple concurrent grants for the same asset (multiple roles approved at different times). At DB session start, effective privileges are the **union** of all active grants. `bundle_id` labels that union for accurate post-activity attribution.
 
 > **Important**: `bundle_id` is computed from the active `activityUID` set at authorization time. It is **not a credential** and is not used for authorization—it is purely an attribution label for reporting and compliance.
+
+### bundle_id vs session_token
+
+| Token | Purpose | Validation |
+|-------|---------|------------|
+| `session_token` | **Binding**: links `/sessions/start` to a specific authorize decision | Single-use, short TTL (60s), validated by jit-server |
+| `bundle_id` | **Attribution**: labels session with effective grants for compliance reporting | Echoed in `/sessions/start` and `/sessions/end` for consistency; not validated |
+
+> `session_token` prevents a compromised proxy from fabricating session reports. `bundle_id` enables post-activity review correlation.
 
 ---
 
@@ -326,9 +338,9 @@ A user may have multiple concurrent grants for the same asset (multiple roles ap
 
 **JWT forwarding**: jit-proxy forwards `prelude.jwt` **verbatim** to jit-server in `X-End-User-JWT` header. jit-proxy does not re-mint, transform, or interpret the JWT beyond size limits.
 
-### JWT Redaction Rules
+### JWT & Token Redaction Rules
 
-The `X-End-User-JWT` header contains sensitive credentials and **must be treated as secret**:
+Both `X-End-User-JWT` and `Authorization: Bearer <service_jwt>` headers contain sensitive credentials and **must be treated as secret**:
 
 | Context | Rule |
 |---------|------|
@@ -337,7 +349,7 @@ The `X-End-User-JWT` header contains sensitive credentials and **must be treated
 | Metrics/traces | **Never emit** |
 | Debugging | Allowed: hashed fingerprint only, e.g., `sha256(jwt)[:16]` |
 
-> **Rationale**: JWT leakage enables session hijacking. Fingerprints allow correlation without exposing the token.
+> **Rationale**: JWT leakage enables session hijacking (user JWT) or service impersonation (service JWT). Fingerprints allow correlation without exposing the token.
 
 ### Anti-Replay Protection
 
@@ -347,20 +359,23 @@ The `X-End-User-JWT` header contains sensitive credentials and **must be treated
 | `nonce` | Unique per request | **jit-server** shared TTL store (2-5 min) |
 
 **Validation split**:
-- **jit-proxy**: lightweight ts sanity (drop obviously stale/future timestamps, e.g., >5 min skew); best-effort local nonce cache using `sha256(raw_jwt + asset_uid + nonce)` as key
+- **jit-proxy**: lightweight ts sanity (drop obviously stale/future timestamps, e.g., >120s skew); best-effort local nonce cache using `sha256(raw_jwt + asset_uid + nonce)` as key
 - **jit-server**: authoritative ts window check (rejects `ts_epoch_ms` outside ±120s even if nonce is new) + authoritative nonce uniqueness via shared TTL store (**recommended: Redis**). CockroachDB can be used with unique constraint + TTL cleanup, but is not preferred due to write load/latency.
+
+> **Window consistency**: Both jit-proxy sanity check and jit-server authoritative check use ±120s. Total prelude→ready timeout (30s) is well under this window.
 
 **Nonce cache key** (jit-server): `hash(jwt_sub + asset_uid + nonce)` — computed after JWT validation, prevents replay across users/assets.
 
 ### Nonce Format
 
+- **Generation**: MUST use cryptographically secure random number generator (CSPRNG)
 - **Encoding**: base64url (RFC 4648 URL-safe, no padding required)
 - **Decoded length**: 16–32 bytes required
 - **Validation**: reject on decode failure or length mismatch
 
 ### CONNECT_DECISION Frame (jit-proxy → pamjit)
 
-After prelude processing, jit-proxy sends **exactly one** decision frame before any DB bytes are forwarded. This allows pamjit to distinguish authorization outcomes from connection failures.
+After prelude processing, jit-proxy sends **exactly one** decision frame on the **same TLS stream**, immediately after prelude and before any database bytes are forwarded. This allows pamjit to distinguish authorization outcomes from connection failures.
 
 **Wire format**: Same as prelude (big-endian uint32 length + UTF-8 JSON payload).
 
@@ -383,15 +398,17 @@ After prelude processing, jit-proxy sends **exactly one** decision frame before 
 ```
 
 **Reason enum** (when `allowed: false`):
+- `invalid_prelude` — prelude parse/validation error
+- `replay_detected` — ts/nonce replay rejected
+- `authorize_timeout` — jit-server call timed out
 - `no_active_grants` — user has no valid grants for asset
 - `authorize_denied` — jit-server rejected (policy, entitlement)
-- `authorize_timeout` — jit-server call timed out
 - `cred_failed` — cred-service call failed
 - `db_connect_failed` — backend DB connection failed
 - `db_auth_failed` — backend DB auth (GSSAPI/SASL) failed
 - `server_busy` — jit-proxy overloaded (backpressure)
-- `invalid_prelude` — prelude parse/validation error
-- `replay_detected` — ts/nonce replay rejected
+
+> **Error priority**: If multiple failures occur, return the **earliest failure in the pipeline** (listed in order above). This ensures deterministic, debuggable error responses.
 
 > **Protocol note**: pamjit MUST wait for this frame before forwarding any client bytes. If the socket closes before receiving CONNECT_DECISION, pamjit should treat it as an internal error.
 
@@ -422,6 +439,7 @@ X-End-User-JWT: <user_jwt>                # end-user identity (validated by jit-
 **Body**:
 ```json
 {
+  "db_session_id": "uuid",
   "asset_uid": "asset-uuid",
   "target_host": "db.example.com",
   "target_port": 26257,
@@ -430,7 +448,7 @@ X-End-User-JWT: <user_jwt>                # end-user identity (validated by jit-
 }
 ```
 
-> **Note**: User identity is derived from `X-End-User-JWT`, not from the request body. jit-server validates the end-user JWT and extracts claims.
+> **Note**: User identity is derived from `X-End-User-JWT`, not from the request body. jit-server validates the end-user JWT and extracts claims. `db_session_id` is generated by jit-proxy before this call.
 
 **Response (Success)**
 
@@ -466,6 +484,7 @@ Called by jit-proxy when DB connection is established.
 {
   "session_token": "opaque-single-use-token",
   "db_session_id": "uuid",
+  "bundle_id": "sha256-hash",
   "asset_uid": "asset-uuid",
   "db_type": "cockroachdb",
   "target_host": "db.example.com",
@@ -475,6 +494,8 @@ Called by jit-proxy when DB connection is established.
   "start_time": "2025-12-30T10:00:00Z"
 }
 ```
+
+> **`db_type` trust**: jit-proxy MUST set `db_type` from the `/authorize` response, not from prelude or local config.
 
 **Response**: `200 OK` with empty body, or `4xx` on validation failure (invalid/expired `session_token`).
 
@@ -499,7 +520,8 @@ Called by jit-proxy when DB session terminates (includes summary).
   "error_count": 0,
   "bytes_up": 12345,
   "bytes_down": 67890,
-  "recording_ref": "s3://bucket/recordings/uuid.jsonl"
+  "recording_ref": "s3://bucket/recordings/uuid.jsonl",
+  "recording_sha256": "abc123..."
 }
 ```
 
@@ -548,6 +570,15 @@ Called by jit-proxy when DB session terminates (includes summary).
 | Framing | Startup + typed messages |
 | Audit | Query/Parse text, CommandComplete, ErrorResponse |
 | Auth | TLS + GSSAPI via cred-service TGT |
+| Cancel | Cancel-key mapping (see below) |
+
+**Cancel-key mapping**: Postgres cancel requests arrive on a separate TCP connection with `(pid, secret_key)`. jit-proxy must:
+1. Intercept `BackendKeyData` from backend and store mapping: `(backend_pid, backend_key) → db_session_id`
+2. Generate synthetic `(frontend_pid, frontend_key)` to send to client
+3. Maintain reverse mapping: `(frontend_pid, frontend_key) → (backend_pid, backend_key)`
+4. On cancel request: look up backend key, forward to correct backend connection
+
+> This enables query cancellation while hiding backend connection details from clients.
 
 ### Cassandra Engine
 
@@ -697,6 +728,34 @@ Blocking executor is **bounded** with concurrency limits and timeouts. If satura
 - Integration with post-activity-review: jit-server **pushes** session summary (or review-server pulls on schedule); actual recording retrieval uses `recording_ref`
 - Retention and cleanup policies are deployment-specific
 
+### Recording Redaction Policy
+
+JSONL recordings may contain sensitive data (PII, secrets in SQL literals). Deployment-specific policy:
+
+| Mode | Description |
+|------|-------------|
+| `full_text` | Record complete query/command text (default for compliance) |
+| `parameterized` | Record query structure with `$N` placeholders; omit literal values |
+| `redacted` | Apply regex-based redaction for known patterns (SSN, credit card, etc.) |
+
+> **MongoDB/Cassandra**: Already avoids full document recording (command names + collections only). This policy primarily affects Postgres/CockroachDB SQL logging.
+
+### Recording Integrity
+
+To detect tampering, jit-proxy computes a checksum on recording close:
+
+- **Algorithm**: SHA-256 of final JSONL file
+- **Storage**: Include `recording_sha256` in `/sessions/end` request and session metadata
+- **Verification**: Post-activity-review can verify checksum before processing
+
+```json
+{
+  "db_session_id": "uuid",
+  "recording_ref": "s3://bucket/recordings/uuid.jsonl",
+  "recording_sha256": "abc123..."
+}
+```
+
 ---
 
 ## Security Boundaries
@@ -739,10 +798,24 @@ Blocking executor is **bounded** with concurrency limits and timeouts. If satura
 
 | Path | Security |
 |------|----------|
-| pamjit → jit-proxy | TLS (server-auth minimum) |
+| pamjit → jit-proxy | TLS (server-auth minimum; mTLS optional) |
 | jit-proxy → jit-server | HTTPS + service JWT |
 | jit-proxy → cred-service | HTTPS + service JWT |
 | jit-proxy → Database | TLS + GSSAPI/SASL |
+
+**mTLS option (pamjit → jit-proxy)**: For stronger workstation identity, deployments may require mTLS with client certificates pinned to device identity. This is optional; server-auth TLS with JWT-based user identity in prelude is the default.
+
+**Certificate trust (pamjit)**: pamjit should use a pinned intermediate CA or explicit trust store for jit-proxy verification, rather than relying on system CA store. This prevents MITM via rogue CA.
+
+### Rate Limiting
+
+| Scope | Limit | Action |
+|-------|-------|--------|
+| Per service identity | Requests/sec to jit-server | 429 Too Many Requests |
+| Per user (jwt_sub) | Authorize calls/min per asset | 429 + backoff hint |
+| Per asset | Total concurrent sessions | Reject with `server_busy` |
+
+> **Rationale**: Per-user/per-asset limits reduce brute-force attempts and prevent single user from exhausting resources.
 
 ### Target Validation
 
