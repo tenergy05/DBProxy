@@ -1,35 +1,36 @@
 # Mongo Protocol Handling (Teleport Reference)
 
-Teleport’s MongoDB engine (see `teleport/lib/srv/db/mongodb/engine.go` and `protocol/*`) keeps the proxy thin: it parses messages for RBAC/audit, but it does not synthesize or cache Mongo responses. All handshake and heartbeat commands are forwarded to the backend; the only local mutation is adjusting `maxMessageSize` based on the server’s handshake reply.
+Teleport’s MongoDB engine (see `teleport/lib/srv/db/mongodb/engine.go` and `protocol/*`) keeps the proxy transparent: it parses messages for RBAC/audit but does not synthesize or cache Mongo responses. Handshake/heartbeat commands are forwarded to the backend; the only side effect is updating `maxMessageSize` from the server’s handshake reply.
 
-## Message IDs and Correlation
-- Mongo wire headers carry `requestID` and `responseTo`. Teleport preserves these end-to-end: the client’s `requestID` is sent unchanged to the backend, and the backend reply’s `responseTo` naturally matches the client `requestID`. There is no ID rewriting or caching, so correlation remains native to Mongo.
-- For fire-and-forget messages (`MoreToCome`), no response is expected and no correlation is needed. When the server sets `MoreToCome`, Teleport drains all subsequent server messages (with their `responseTo` set) and forwards them in order to the client.
-- Error path before first reply: if backend connection fails and no client message has been seen, Teleport waits for the first client message (usually `isMaster`/`hello`) and uses its `requestID` to frame a proper error reply via `protocol.ReplyError`, ensuring the client can match the error to its request.
+## Message IDs & Correlation
+- Mongo wire headers carry `requestID` and `responseTo`. Teleport preserves them end-to-end—no rewriting. Client `requestID` goes to the backend; backend `responseTo` matches naturally.
+- Fire-and-forget (`MoreToCome` on client) returns immediately. If the server sets `MoreToCome`, Teleport drains subsequent replies in order and forwards them.
+- If backend connect fails before any client message, Teleport waits for the first client message (often `isMaster`/`hello`) and uses its `requestID` to frame an error via `protocol.ReplyError` so the client can correlate it.
 
-## Handshake (`isMaster`/`hello`) and Heartbeats
-- Clients typically start with `isMaster` (legacy) or `hello` (modern). `protocol.IsHandshake` flags these by command name (case-insensitive for `isMaster`).
-- Engine flow:
-  1) Authorize the command (denies auth-related commands like `authenticate`, `saslStart`, `saslContinue`, `logout`; otherwise checks DB/user via roles).
-  2) Forward the raw message to the server (`serverConn.WriteWireMessage`) with the original `requestID`.
-  3) If the message has `MoreToCome` set, return immediately (fire-and-forget semantics).
-  4) Otherwise read the server reply (`protocol.ReadServerMessage`) and forward it to the client. If `MoreToCome` is set on the server’s message, keep draining and forwarding until cleared.
-- Special handling of handshake replies: after reading the server’s handshake reply, `processHandshakeResponse` parses it with `description.NewServer` to learn `MaxMessageSize` and updates the engine’s limit. The reply itself is forwarded untouched; IDs stay intact.
-- Heartbeat-style commands like `ping` are treated the same as any other command: authorized and forwarded; no local reply or caching.
+## Handshake (`isMaster`/`hello`) & Heartbeats
+- Detection: `protocol.IsHandshake` flags `isMaster` (case-insensitive) or `hello` (case-sensitive), works for `OP_MSG` and legacy `OP_QUERY`.
+- Flow: authorize command → forward to server with original IDs → if `MoreToCome` on client, return; else read server reply, forward it, and if `MoreToCome` on server, drain all parts.
+- Handshake response processing: `processHandshakeResponse` parses the server reply with `description.NewServer` and updates `maxMessageSize`; the reply itself is forwarded unchanged.
+- Heartbeats like `ping` are treated like any other command: authorized and forwarded; no local replies or caching.
 
-## Caching / Local Responses
-- Teleport does **not** cache `isMaster`/`hello`/heartbeat responses and does not serve them locally. Every command is forwarded to the backend unless RBAC denies it, in which case an error is sent instead of the backend reply.
-- There is no local short-circuit for hello/heartbeats; backend availability and responses are always authoritative.
+## Auth Commands Blocked
+- Commands `authenticate`, `saslStart`, `saslContinue`, `logout` are denied (not forwarded). Auth is handled at TLS/x509 layer in Teleport; clients can’t re-auth mid-connection.
 
-## Message Types & More-To-Come
-- Supported opcodes include legacy `OP_QUERY`/`OP_REPLY` (still used by older `isMaster`), modern `OP_MSG`, and `OP_COMPRESSED`.
-- `MoreToCome` flags (both client and server) are honored: if a client sends a fire-and-forget message, Teleport doesn’t await a reply; if the server indicates more responses, Teleport drains and forwards them all in order.
+## No Caching / No Synthetic Replies
+- Teleport never caches or locally answers `isMaster`/`hello`/heartbeat responses. Every allowed command goes to the backend; denied commands get an error instead of a backend reply.
+- The only state derived from handshake is `maxMessageSize`; all other fields and replies pass through untouched.
 
-## Audit/Authorization Context
-- Each client message is parsed to extract database/command for RBAC and audit; auth commands are blocked outright.
-- Query audit logs the command string; results are just forwarded (no result caching or rewriting).
+## Wire Protocol Coverage & MoreToCome
+- Supported opcodes: legacy `OP_QUERY/OP_REPLY` (old `isMaster`), modern `OP_MSG`, `OP_COMPRESSED`, plus legacy CRUD opcodes.
+- `MoreToCome` honored both directions: client fire-and-forget doesn’t wait; server multi-part replies are fully forwarded.
+
+## Error Path Before First Reply
+- On backend connect errors with no prior client message, Teleport waits for the first client message to frame an error using that `requestID` so clients can parse it correctly. Then it sends the error and closes.
+
+## Server Connection Handshake (No-Op)
+- When Teleport dials Mongo, it uses a no-op handshaker so it doesn’t send its own metadata `isMaster`; otherwise the client’s handshake would be rejected because Mongo treats client metadata as immutable per connection.
 
 ## Summary
-- Handshake/heartbeat commands (`isMaster`/`hello`/`ping`) are forwarded; Teleport does not cache or locally answer them.
-- Message IDs (`requestID`/`responseTo`) are preserved; errors before backend connect are framed against the first client `requestID`.
-- The only handshake side-effect is updating `maxMessageSize` from the server’s reply.***
+- Forward everything (except blocked auth commands); no caching/synthetic responses.
+- Preserve `requestID/responseTo`; adjust `maxMessageSize` from server handshake.
+- Honor `MoreToCome`; frame early errors against the first client `requestID`.***
